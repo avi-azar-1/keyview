@@ -1,0 +1,7 @@
+services:
+  keyview:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - STATIC_DIR=/app/static
