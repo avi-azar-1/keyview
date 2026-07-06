@@ -6,15 +6,19 @@ import redis
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 NAMESPACES = ["user", "session", "cache", "order", "product", "analytics", "config"]
+SUFFIXES = ["data", "meta", "idx", "info", "count", "list", "set", "score"]
 random.seed(42)
 
 print("Seeding Redis with sample data...")
+
+r.flushdb()
 
 pipe = r.pipeline(transaction=False)
 
 for i in range(5000):
     ns = random.choice(NAMESPACES)
-    key = f"{ns}:{random.randint(1000, 9999)}:{random.choice(['data', 'meta', 'idx'])}"
+    suffix = random.choice(SUFFIXES)
+    key = f"{ns}:{i}:{suffix}"
 
     key_type = random.choices(
         ["string", "hash", "list", "set", "zset"],
