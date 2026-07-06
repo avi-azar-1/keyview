@@ -51,6 +51,11 @@ export default function Dashboard() {
           <span className="font-mono font-medium text-gray-900 dark:text-white">
             Redis {connectionInfo?.redis_version}
           </span>
+          {connectionInfo?.cluster_mode && (
+            <span className="ml-2 px-2 py-0.5 text-xs font-medium bg-purple-100 dark:bg-purple-900 text-purple-700 dark:text-purple-300 rounded-full">
+              Cluster · {connectionInfo.node_count} nodes
+            </span>
+          )}
           {" · "}
           {connectionInfo?.used_memory_human} memory
         </div>

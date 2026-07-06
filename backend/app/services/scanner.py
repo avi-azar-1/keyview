@@ -79,8 +79,14 @@ class Scanner:
         self._task = asyncio.create_task(self._run_scan())
 
     async def _run_scan(self):
-        r = redis_client.pool
-        total_estimate = await r.dbsize()
+        nodes = await redis_client.get_primary_nodes()
+
+        total_estimate = 0
+        for node in nodes:
+            try:
+                total_estimate += await node.dbsize()
+            except Exception:
+                pass
 
         self._progress = ScanProgress(
             status="scanning", scanned=0, total_estimate=total_estimate, percent=0.0
@@ -93,43 +99,44 @@ class Scanner:
         pattern_counts: dict[str, int] = defaultdict(int)
         scanned = 0
 
-        cursor = 0
-        while True:
-            cursor, keys = await r.scan(cursor, count=settings.redis_scan_count)
+        for node in nodes:
+            cursor = 0
+            while True:
+                cursor, keys = await node.scan(cursor, count=settings.redis_scan_count)
 
-            for i in range(0, len(keys), settings.redis_pipeline_batch):
-                batch = keys[i : i + settings.redis_pipeline_batch]
-                pipe = r.pipeline(transaction=False)
-                for key in batch:
-                    pipe.type(key)
-                    pipe.ttl(key)
-                results = await pipe.execute()
+                for i in range(0, len(keys), settings.redis_pipeline_batch):
+                    batch = keys[i : i + settings.redis_pipeline_batch]
+                    pipe = node.pipeline(transaction=False)
+                    for key in batch:
+                        pipe.type(key)
+                        pipe.ttl(key)
+                    results = await pipe.execute()
 
-                for j, key in enumerate(batch):
-                    key_type = results[j * 2]
-                    key_ttl = results[j * 2 + 1]
+                    for j, key in enumerate(batch):
+                        key_type = results[j * 2]
+                        key_ttl = results[j * 2 + 1]
 
-                    type_counts[key_type] += 1
-                    ttl_counts[classify_ttl(key_ttl)] += 1
-                    namespace_counts[extract_namespace(key)] += 1
+                        type_counts[key_type] += 1
+                        ttl_counts[classify_ttl(key_ttl)] += 1
+                        namespace_counts[extract_namespace(key)] += 1
 
-                    for pat in self._patterns:
-                        if fnmatch.fnmatch(key, pat):
-                            pattern_counts[pat] += 1
-                            break
+                        for pat in self._patterns:
+                            if fnmatch.fnmatch(key, pat):
+                                pattern_counts[pat] += 1
+                                break
 
-                scanned += len(batch)
-                pct = min((scanned / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
-                self._progress = ScanProgress(
-                    status="scanning",
-                    scanned=scanned,
-                    total_estimate=total_estimate,
-                    percent=round(pct, 1),
-                )
-                await self._notify()
+                    scanned += len(batch)
+                    pct = min((scanned / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
+                    self._progress = ScanProgress(
+                        status="scanning",
+                        scanned=scanned,
+                        total_estimate=total_estimate,
+                        percent=round(pct, 1),
+                    )
+                    await self._notify()
 
-            if cursor == 0:
-                break
+                if cursor == 0:
+                    break
 
         ttl_buckets = [
             TTLBucket(label=label, count=ttl_counts.get(label, 0))

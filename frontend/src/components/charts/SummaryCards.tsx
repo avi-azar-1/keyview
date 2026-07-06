@@ -8,6 +8,9 @@ export default function SummaryCards() {
     { label: "Total Keys", value: result?.total_keys?.toLocaleString() ?? "-" },
     { label: "Memory", value: info?.used_memory_human ?? "-" },
     { label: "Clients", value: info?.connected_clients?.toString() ?? "-" },
+    ...(info?.cluster_mode
+      ? [{ label: "Primary Nodes", value: info.node_count.toString() }]
+      : []),
     { label: "Key Types", value: result ? Object.keys(result.type_counts).length.toString() : "-" },
   ];
 

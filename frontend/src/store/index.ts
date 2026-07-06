@@ -6,6 +6,8 @@ export interface ConnectionInfo {
   used_memory_human: string;
   total_keys: number;
   uptime_in_seconds: number;
+  cluster_mode: boolean;
+  node_count: number;
 }
 
 export interface TTLBucket {

@@ -15,3 +15,5 @@ class ConnectionInfo(BaseModel):
     used_memory_human: str
     total_keys: int
     uptime_in_seconds: int
+    cluster_mode: bool = False
+    node_count: int = 1
