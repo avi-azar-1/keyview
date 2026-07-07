@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useStore } from "../store";
 import { disconnect } from "../api/connection";
 import { startScan, getScanResults } from "../api/scan";
-import { createScanSocket } from "../api/websocket";
+import { createDetailScanSocket } from "../api/websocket";
 import SummaryCards from "./charts/SummaryCards";
 import TypeDistribution from "./charts/TypeDistribution";
 import TTLDistribution from "./charts/TTLDistribution";
@@ -10,53 +10,102 @@ import KeyGroupBreakdown from "./charts/KeyGroupBreakdown";
 import NamespaceTreemap from "./charts/NamespaceTreemap";
 import PrefixSuggestions from "./PrefixSuggestions";
 import PatternEditor from "./PatternEditor";
+import type { ScanProgress } from "../store";
 
 export default function Dashboard() {
   const connectionInfo = useStore((s) => s.connectionInfo);
   const scanProgress = useStore((s) => s.scanProgress);
+  const detailProgress = useStore((s) => s.detailProgress);
   const setScanProgress = useStore((s) => s.setScanProgress);
+  const setDetailProgress = useStore((s) => s.setDetailProgress);
   const setScanResult = useStore((s) => s.setScanResult);
+  const updateDetailResult = useStore((s) => s.updateDetailResult);
   const setDisconnected = useStore((s) => s.setDisconnected);
-  const wsRef = useRef<WebSocket | null>(null);
+  const scanWsRef = useRef<WebSocket | null>(null);
+  const detailWsRef = useRef<WebSocket | null>(null);
   const [scanCount, setScanCount] = useState(10000);
   const scanStartRef = useRef<number | null>(null);
+  const detailStartRef = useRef<number | null>(null);
   const [eta, setEta] = useState<string>("");
+  const [detailEta, setDetailEta] = useState<string>("");
+  const pendingScanRef = useRef(false);
+
+  // Persistent main scan websocket
+  useEffect(() => {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/scan`);
+    ws.onmessage = (event) => {
+      const data: ScanProgress = JSON.parse(event.data);
+      setScanProgress(data);
+      if (data.status === "scanning" && !scanStartRef.current) {
+        scanStartRef.current = Date.now();
+      }
+      if (data.status === "scanning" && data.percent > 0 && scanStartRef.current) {
+        const elapsed = (Date.now() - scanStartRef.current) / 1000;
+        const remaining = (elapsed / data.percent) * (100 - data.percent);
+        if (remaining < 60) {
+          setEta(`~${Math.ceil(remaining)}s left`);
+        } else {
+          setEta(`~${Math.ceil(remaining / 60)}m left`);
+        }
+      }
+      if (data.status === "completed") {
+        setEta("");
+        scanStartRef.current = null;
+        if (pendingScanRef.current) {
+          pendingScanRef.current = false;
+          getScanResults().then((results) => {
+            setScanResult(results);
+            // Start listening for detail phase
+            detailStartRef.current = Date.now();
+            detailWsRef.current?.close();
+            detailWsRef.current = createDetailScanSocket(
+              (progress) => {
+                setDetailProgress(progress);
+                if (progress.status === "scanning" && progress.percent > 0 && detailStartRef.current) {
+                  const elapsed = (Date.now() - detailStartRef.current) / 1000;
+                  const remaining = (elapsed / progress.percent) * (100 - progress.percent);
+                  if (remaining < 60) {
+                    setDetailEta(`~${Math.ceil(remaining)}s left`);
+                  } else {
+                    setDetailEta(`~${Math.ceil(remaining / 60)}m left`);
+                  }
+                }
+              },
+              async () => {
+                setDetailEta("");
+                const r = await getScanResults();
+                updateDetailResult(r.type_counts, r.ttl_buckets);
+              }
+            );
+          });
+        }
+      }
+    };
+    scanWsRef.current = ws;
+    return () => {
+      ws.close();
+      scanWsRef.current = null;
+    };
+  }, [setScanProgress, setScanResult, setDetailProgress, updateDetailResult]);
 
   const handleScan = useCallback(async () => {
-    wsRef.current?.close();
     scanStartRef.current = Date.now();
     setEta("");
-    wsRef.current = createScanSocket(
-      (progress) => {
-        setScanProgress(progress);
-        if (progress.status === "scanning" && progress.percent > 0 && scanStartRef.current) {
-          const elapsed = (Date.now() - scanStartRef.current) / 1000;
-          const remaining = (elapsed / progress.percent) * (100 - progress.percent);
-          if (remaining < 60) {
-            setEta(`~${Math.ceil(remaining)}s left`);
-          } else {
-            setEta(`~${Math.ceil(remaining / 60)}m left`);
-          }
-        }
-      },
-      async () => {
-        setEta("");
-        const results = await getScanResults();
-        setScanResult(results);
-      }
-    );
+    setDetailEta("");
+    pendingScanRef.current = true;
+    detailWsRef.current?.close();
     await startScan(scanCount);
-  }, [setScanProgress, setScanResult, scanCount]);
+  }, [scanCount]);
 
   useEffect(() => {
     handleScan();
-    return () => {
-      wsRef.current?.close();
-    };
   }, [handleScan]);
 
   async function handleDisconnect() {
-    wsRef.current?.close();
+    scanWsRef.current?.close();
+    scanWsRef.current = null;
+    detailWsRef.current?.close();
     await disconnect();
     setDisconnected();
   }
@@ -122,14 +171,50 @@ export default function Dashboard() {
       <SummaryCards />
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <TypeDistribution />
-        <TTLDistribution />
         <KeyGroupBreakdown />
         <NamespaceTreemap />
       </div>
 
       <PrefixSuggestions />
       <PatternEditor />
+
+      {/* Phase 2: Type + TTL (background) */}
+      <div className="border-t border-gray-200 dark:border-gray-700 pt-6">
+        <div className="flex items-center gap-3 mb-4">
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+            Key Types & TTL
+          </h3>
+          {detailProgress.status === "scanning" && (
+            <span className="text-xs font-medium text-gray-500 dark:text-gray-400">
+              Analyzing...
+            </span>
+          )}
+          {detailProgress.status === "completed" && (
+            <span className="text-xs font-medium text-green-600 dark:text-green-400">
+              Done
+            </span>
+          )}
+        </div>
+
+        {detailProgress.status === "scanning" && (
+          <div className="flex items-center gap-3 mb-4">
+            <div className="flex-1 bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+              <div
+                className="bg-purple-600 h-2 rounded-full transition-all duration-300"
+                style={{ width: `${detailProgress.percent}%` }}
+              />
+            </div>
+            <span className="text-sm font-medium text-gray-700 dark:text-gray-300 text-right whitespace-nowrap">
+              {detailProgress.percent}%{detailEta && ` · ${detailEta}`}
+            </span>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <TypeDistribution />
+          <TTLDistribution />
+        </div>
+      </div>
     </div>
   );
 }

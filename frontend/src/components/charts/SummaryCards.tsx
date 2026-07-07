@@ -11,7 +11,7 @@ export default function SummaryCards() {
     ...(info?.cluster_mode
       ? [{ label: "Primary Nodes", value: info.node_count.toString() }]
       : []),
-    { label: "Key Types", value: result ? Object.keys(result.type_counts).length.toString() : "-" },
+    { label: "Namespaces", value: result ? Object.keys(result.namespace_counts).length.toString() : "-" },
   ];
 
   return (

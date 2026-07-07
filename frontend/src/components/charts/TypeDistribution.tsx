@@ -14,10 +14,10 @@ export default function TypeDistribution() {
   const result = useStore((s) => s.scanResult);
   const darkMode = useStore((s) => s.darkMode);
 
-  if (!result) {
+  if (!result || Object.keys(result.type_counts).length === 0) {
     return (
       <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-100 dark:border-gray-700 flex items-center justify-center h-80">
-        <span className="text-gray-400">Waiting for scan...</span>
+        <span className="text-gray-400">Analyzing key types...</span>
       </div>
     );
   }

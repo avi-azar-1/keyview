@@ -5,10 +5,10 @@ export default function TTLDistribution() {
   const result = useStore((s) => s.scanResult);
   const darkMode = useStore((s) => s.darkMode);
 
-  if (!result) {
+  if (!result || result.ttl_buckets.length === 0) {
     return (
       <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-100 dark:border-gray-700 flex items-center justify-center h-80">
-        <span className="text-gray-400">Waiting for scan...</span>
+        <span className="text-gray-400">Analyzing TTL distribution...</span>
       </div>
     );
   }

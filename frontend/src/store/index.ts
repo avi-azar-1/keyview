@@ -48,6 +48,7 @@ interface AppState {
   connected: boolean;
   connectionInfo: ConnectionInfo | null;
   scanProgress: ScanProgress;
+  detailProgress: ScanProgress;
   scanResult: ScanResult | null;
   patterns: Pattern[];
   darkMode: boolean;
@@ -55,9 +56,11 @@ interface AppState {
   setConnected: (info: ConnectionInfo) => void;
   setDisconnected: () => void;
   setScanProgress: (progress: ScanProgress) => void;
+  setDetailProgress: (progress: ScanProgress) => void;
   setScanResult: (result: ScanResult) => void;
   setPatterns: (patterns: Pattern[]) => void;
   updatePatternCounts: (counts: Record<string, number>) => void;
+  updateDetailResult: (type_counts: Record<string, number>, ttl_buckets: TTLBucket[]) => void;
   toggleDarkMode: () => void;
 }
 
@@ -65,6 +68,7 @@ export const useStore = create<AppState>((set) => ({
   connected: false,
   connectionInfo: null,
   scanProgress: { status: "idle", scanned: 0, total_estimate: 0, percent: 0 },
+  detailProgress: { status: "idle", scanned: 0, total_estimate: 0, percent: 0 },
   scanResult: null,
   patterns: [],
   darkMode: window.matchMedia("(prefers-color-scheme: dark)").matches,
@@ -76,14 +80,22 @@ export const useStore = create<AppState>((set) => ({
       connectionInfo: null,
       scanResult: null,
       scanProgress: { status: "idle", scanned: 0, total_estimate: 0, percent: 0 },
+      detailProgress: { status: "idle", scanned: 0, total_estimate: 0, percent: 0 },
     }),
   setScanProgress: (progress) => set({ scanProgress: progress }),
+  setDetailProgress: (progress) => set({ detailProgress: progress }),
   setScanResult: (result) => set({ scanResult: result }),
   setPatterns: (patterns) => set({ patterns }),
   updatePatternCounts: (counts) =>
     set((state) => ({
       scanResult: state.scanResult
         ? { ...state.scanResult, pattern_counts: counts }
+        : null,
+    })),
+  updateDetailResult: (type_counts, ttl_buckets) =>
+    set((state) => ({
+      scanResult: state.scanResult
+        ? { ...state.scanResult, type_counts, ttl_buckets }
         : null,
     })),
   toggleDarkMode: () =>

@@ -25,6 +25,11 @@ async def scan_status():
     return scanner.progress
 
 
+@router.get("/detail/status", response_model=ScanProgress)
+async def detail_status():
+    return scanner.detail_progress
+
+
 @router.get("/results", response_model=ScanResult)
 async def scan_results():
     if scanner.result is None:

@@ -40,14 +40,21 @@ def extract_namespace(key: str, delimiter: str = ":") -> str:
 class Scanner:
     def __init__(self):
         self._progress = ScanProgress(status="idle")
+        self._detail_progress = ScanProgress(status="idle")
         self._result: ScanResult | None = None
         self._task: asyncio.Task | None = None
+        self._detail_task: asyncio.Task | None = None
         self._listeners: list[asyncio.Queue] = []
+        self._detail_listeners: list[asyncio.Queue] = []
         self._patterns: list[str] = []
 
     @property
     def progress(self) -> ScanProgress:
         return self._progress
+
+    @property
+    def detail_progress(self) -> ScanProgress:
+        return self._detail_progress
 
     @property
     def result(self) -> ScanResult | None:
@@ -70,9 +77,22 @@ class Scanner:
         if q in self._listeners:
             self._listeners.remove(q)
 
+    def subscribe_detail(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self._detail_listeners.append(q)
+        return q
+
+    def unsubscribe_detail(self, q: asyncio.Queue):
+        if q in self._detail_listeners:
+            self._detail_listeners.remove(q)
+
     async def _notify(self):
         for q in self._listeners:
             await q.put(self._progress.model_dump())
+
+    async def _notify_detail(self):
+        for q in self._detail_listeners:
+            await q.put(self._detail_progress.model_dump())
 
     async def start_scan(self, scan_count: int | None = None):
         if self._task and not self._task.done():
@@ -81,6 +101,7 @@ class Scanner:
         self._task = asyncio.create_task(self._run_scan())
 
     async def _run_scan(self):
+        """Phase 1: fast scan-only pass. Collects namespaces, patterns, prefixes."""
         nodes = await redis_client.get_primary_nodes()
 
         dbsizes = await asyncio.gather(
@@ -93,8 +114,6 @@ class Scanner:
         )
         await self._notify()
 
-        type_counts: dict[str, int] = defaultdict(int)
-        ttl_counts: dict[str, int] = defaultdict(int)
         namespace_counts: dict[str, int] = defaultdict(int)
         pattern_counts: dict[str, int] = defaultdict(int)
         prefix_tree = PrefixTree(
@@ -103,56 +122,29 @@ class Scanner:
         self._scanned = 0
         self._total_estimate = total_estimate
 
-        max_concurrent_pipelines = 4
-
-        async def run_pipeline(node, batch):
-            pipe = node.pipeline(transaction=False)
-            for key in batch:
-                pipe.type(key)
-                pipe.ttl(key)
-            return await pipe.execute()
-
         async def scan_node(node):
             cursor = 0
             while True:
                 cursor, keys = await node.scan(cursor, count=self._scan_count)
 
-                batches = [
-                    keys[i : i + settings.redis_pipeline_batch]
-                    for i in range(0, len(keys), settings.redis_pipeline_batch)
-                ]
+                for key in keys:
+                    namespace_counts[extract_namespace(key)] += 1
+                    prefix_tree.insert(key)
 
-                for ci in range(0, len(batches), max_concurrent_pipelines):
-                    chunk = batches[ci : ci + max_concurrent_pipelines]
-                    all_results = await asyncio.gather(
-                        *[run_pipeline(node, batch) for batch in chunk]
-                    )
+                    for pat in self._patterns:
+                        if fnmatch.fnmatch(key, pat):
+                            pattern_counts[pat] += 1
+                            break
 
-                    for batch, results in zip(chunk, all_results):
-                        for j, key in enumerate(batch):
-                            key_type = results[j * 2]
-                            key_ttl = results[j * 2 + 1]
-
-                            type_counts[key_type] += 1
-                            ttl_counts[classify_ttl(key_ttl)] += 1
-                            namespace_counts[extract_namespace(key)] += 1
-                            prefix_tree.insert(key)
-
-                            for pat in self._patterns:
-                                if fnmatch.fnmatch(key, pat):
-                                    pattern_counts[pat] += 1
-                                    break
-
-                        self._scanned += len(batch)
-
-                    pct = min((self._scanned / self._total_estimate) * 100, 100.0) if self._total_estimate > 0 else 100.0
-                    self._progress = ScanProgress(
-                        status="scanning",
-                        scanned=self._scanned,
-                        total_estimate=self._total_estimate,
-                        percent=round(pct, 1),
-                    )
-                    await self._notify()
+                self._scanned += len(keys)
+                pct = min((self._scanned / self._total_estimate) * 100, 100.0) if self._total_estimate > 0 else 100.0
+                self._progress = ScanProgress(
+                    status="scanning",
+                    scanned=self._scanned,
+                    total_estimate=self._total_estimate,
+                    percent=round(pct, 1),
+                )
+                await self._notify()
 
                 if cursor == 0:
                     break
@@ -175,15 +167,10 @@ class Scanner:
             for s in raw_suggestions
         ]
 
-        ttl_buckets = [
-            TTLBucket(label=label, count=ttl_counts.get(label, 0))
-            for label, _, _ in TTL_BUCKET_RANGES
-        ]
-
         self._result = ScanResult(
             total_keys=self._scanned,
-            type_counts=dict(type_counts),
-            ttl_buckets=ttl_buckets,
+            type_counts={},
+            ttl_buckets=[],
             namespace_counts=dict(namespace_counts),
             pattern_counts=dict(pattern_counts),
             suggested_prefixes=suggested_prefixes,
@@ -196,6 +183,97 @@ class Scanner:
             percent=100.0,
         )
         await self._notify()
+
+        # Automatically kick off phase 2 in background
+        self._start_detail_scan()
+
+    def _start_detail_scan(self):
+        if self._detail_task and not self._detail_task.done():
+            return
+        self._detail_task = asyncio.create_task(self._run_detail_scan())
+
+    async def _run_detail_scan(self):
+        """Phase 2: full scan with TYPE + TTL pipelines."""
+        nodes = await redis_client.get_primary_nodes()
+
+        dbsizes = await asyncio.gather(
+            *[node.dbsize() for node in nodes], return_exceptions=True
+        )
+        total_estimate = sum(s for s in dbsizes if isinstance(s, int))
+
+        self._detail_progress = ScanProgress(
+            status="scanning", scanned=0, total_estimate=total_estimate, percent=0.0
+        )
+        await self._notify_detail()
+
+        type_counts: dict[str, int] = defaultdict(int)
+        ttl_counts: dict[str, int] = defaultdict(int)
+        detail_scanned = 0
+        max_concurrent_pipelines = 4
+
+        async def run_pipeline(node, batch):
+            pipe = node.pipeline(transaction=False)
+            for key in batch:
+                pipe.type(key)
+                pipe.ttl(key)
+            return await pipe.execute()
+
+        async def scan_node(node):
+            nonlocal detail_scanned
+            cursor = 0
+            while True:
+                cursor, keys = await node.scan(cursor, count=self._scan_count)
+
+                batches = [
+                    keys[i : i + settings.redis_pipeline_batch]
+                    for i in range(0, len(keys), settings.redis_pipeline_batch)
+                ]
+
+                for ci in range(0, len(batches), max_concurrent_pipelines):
+                    chunk = batches[ci : ci + max_concurrent_pipelines]
+                    all_results = await asyncio.gather(
+                        *[run_pipeline(node, batch) for batch in chunk]
+                    )
+
+                    for batch, results in zip(chunk, all_results):
+                        for j, key in enumerate(batch):
+                            key_type = results[j * 2]
+                            key_ttl = results[j * 2 + 1]
+                            type_counts[key_type] += 1
+                            ttl_counts[classify_ttl(key_ttl)] += 1
+
+                        detail_scanned += len(batch)
+
+                    pct = min((detail_scanned / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
+                    self._detail_progress = ScanProgress(
+                        status="scanning",
+                        scanned=detail_scanned,
+                        total_estimate=total_estimate,
+                        percent=round(pct, 1),
+                    )
+                    await self._notify_detail()
+
+                if cursor == 0:
+                    break
+
+        await asyncio.gather(*[scan_node(node) for node in nodes])
+
+        ttl_buckets = [
+            TTLBucket(label=label, count=ttl_counts.get(label, 0))
+            for label, _, _ in TTL_BUCKET_RANGES
+        ]
+
+        if self._result:
+            self._result.type_counts = dict(type_counts)
+            self._result.ttl_buckets = ttl_buckets
+
+        self._detail_progress = ScanProgress(
+            status="completed",
+            scanned=detail_scanned,
+            total_estimate=total_estimate,
+            percent=100.0,
+        )
+        await self._notify_detail()
 
 
 scanner = Scanner()
