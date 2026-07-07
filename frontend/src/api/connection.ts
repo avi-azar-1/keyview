@@ -7,6 +7,7 @@ export interface ConnectParams {
   username?: string;
   password?: string;
   db: number;
+  cluster_mode?: boolean | null;
 }
 
 export function connect(params: ConnectParams) {

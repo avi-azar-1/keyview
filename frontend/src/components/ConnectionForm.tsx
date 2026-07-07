@@ -9,6 +9,7 @@ export default function ConnectionForm() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [db, setDb] = useState("0");
+  const [clusterMode, setClusterMode] = useState<"auto" | "on" | "off">("auto");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -23,6 +24,7 @@ export default function ConnectionForm() {
         username: username || undefined,
         password: password || undefined,
         db: parseInt(db),
+        cluster_mode: clusterMode === "auto" ? null : clusterMode === "on",
       });
       setConnected(info);
     } catch (err) {
@@ -74,6 +76,27 @@ export default function ConnectionForm() {
                 onChange={(e) => setDb(e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Cluster Mode
+            </label>
+            <div className="flex gap-1 p-1 bg-gray-100 dark:bg-gray-700 rounded-lg">
+              {(["auto", "on", "off"] as const).map((opt) => (
+                <button
+                  key={opt}
+                  type="button"
+                  onClick={() => setClusterMode(opt)}
+                  className={`flex-1 px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
+                    clusterMode === opt
+                      ? "bg-white dark:bg-gray-600 text-gray-900 dark:text-white shadow-sm"
+                      : "text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+                  }`}
+                >
+                  {opt === "auto" ? "Auto-detect" : opt === "on" ? "Cluster" : "Standalone"}
+                </button>
+              ))}
             </div>
           </div>
           <div>

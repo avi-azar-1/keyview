@@ -9,6 +9,7 @@ class ConnectionRequest(BaseModel):
     username: str | None = None
     password: str | None = None
     db: int = 0
+    cluster_mode: bool | None = None
 
     @field_validator("host")
     @classmethod

@@ -37,12 +37,17 @@ class RedisClient:
             decode_responses=True,
         )
 
-        try:
-            await standalone.ping()
-            cluster_info = await standalone.execute_command("CLUSTER", "INFO")
-            is_cluster = "cluster_enabled:1" in cluster_info if isinstance(cluster_info, str) else False
-        except Exception:
-            is_cluster = False
+        if params.cluster_mode is not None:
+            is_cluster = params.cluster_mode
+            if not is_cluster:
+                await standalone.ping()
+        else:
+            try:
+                await standalone.ping()
+                cluster_info = await standalone.execute_command("CLUSTER", "INFO")
+                is_cluster = "cluster_enabled:1" in cluster_info if isinstance(cluster_info, str) else False
+            except Exception:
+                is_cluster = False
 
         if is_cluster:
             await standalone.aclose()
