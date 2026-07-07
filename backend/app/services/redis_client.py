@@ -8,6 +8,7 @@ class RedisClient:
         self._client: aioredis.Redis | aioredis.RedisCluster | None = None
         self._connection_params: ConnectionRequest | None = None
         self._is_cluster: bool = False
+        self._node_connections: list[aioredis.Redis] = []
 
     @property
     def connected(self) -> bool:
@@ -68,6 +69,9 @@ class RedisClient:
         return await self.get_info()
 
     async def disconnect(self):
+        for node in self._node_connections:
+            await node.aclose()
+        self._node_connections = []
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -81,7 +85,15 @@ class RedisClient:
 
         nodes = []
         for node in self._client.get_primaries():
-            nodes.append(self._client.get_redis_connection(node))
+            r = aioredis.Redis(
+                host=node.host,
+                port=node.port,
+                username=self._connection_params.username,
+                password=self._connection_params.password,
+                decode_responses=True,
+            )
+            nodes.append(r)
+        self._node_connections = nodes
         return nodes
 
     async def get_info(self) -> ConnectionInfo:
