@@ -8,6 +8,7 @@ import TypeDistribution from "./charts/TypeDistribution";
 import TTLDistribution from "./charts/TTLDistribution";
 import KeyGroupBreakdown from "./charts/KeyGroupBreakdown";
 import NamespaceTreemap from "./charts/NamespaceTreemap";
+import PrefixSuggestions from "./PrefixSuggestions";
 import PatternEditor from "./PatternEditor";
 
 export default function Dashboard() {
@@ -111,6 +112,7 @@ export default function Dashboard() {
         <NamespaceTreemap />
       </div>
 
+      <PrefixSuggestions />
       <PatternEditor />
     </div>
   );

@@ -3,7 +3,8 @@ import fnmatch
 from collections import defaultdict
 
 from app.config import settings
-from app.models.scan_result import ScanProgress, ScanResult, TTLBucket
+from app.models.scan_result import PrefixSuggestion, ScanProgress, ScanResult, TTLBucket
+from app.services.prefix_trie import PrefixTree
 from app.services.redis_client import redis_client
 
 TTL_BUCKET_RANGES = [
@@ -98,6 +99,9 @@ class Scanner:
         ttl_counts: dict[str, int] = defaultdict(int)
         namespace_counts: dict[str, int] = defaultdict(int)
         pattern_counts: dict[str, int] = defaultdict(int)
+        prefix_tree = PrefixTree(
+            max_depth=settings.prefix_tree_max_depth, min_count=50
+        )
         self._scanned = 0
         self._total_estimate = total_estimate
 
@@ -134,6 +138,7 @@ class Scanner:
                             type_counts[key_type] += 1
                             ttl_counts[classify_ttl(key_ttl)] += 1
                             namespace_counts[extract_namespace(key)] += 1
+                            prefix_tree.insert(key)
 
                             for pat in self._patterns:
                                 if fnmatch.fnmatch(key, pat):
@@ -156,6 +161,22 @@ class Scanner:
 
         await asyncio.gather(*[scan_node(node) for node in nodes])
 
+        prune_threshold = max(int(prefix_tree.total_keys * 0.001), 50)
+        prefix_tree.prune(prune_threshold)
+        raw_suggestions = prefix_tree.suggest(
+            top_n=settings.prefix_suggestion_count
+        )
+        suggested_prefixes = [
+            PrefixSuggestion(
+                prefix=s["prefix"],
+                key_count=s["key_count"],
+                depth=s["depth"],
+                child_count=s["child_count"],
+                coverage_pct=s["coverage_pct"],
+            )
+            for s in raw_suggestions
+        ]
+
         ttl_buckets = [
             TTLBucket(label=label, count=ttl_counts.get(label, 0))
             for label, _, _ in TTL_BUCKET_RANGES
@@ -167,6 +188,7 @@ class Scanner:
             ttl_buckets=ttl_buckets,
             namespace_counts=dict(namespace_counts),
             pattern_counts=dict(pattern_counts),
+            suggested_prefixes=suggested_prefixes,
         )
 
         self._progress = ScanProgress(

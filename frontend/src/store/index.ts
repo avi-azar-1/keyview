@@ -15,12 +15,21 @@ export interface TTLBucket {
   count: number;
 }
 
+export interface PrefixSuggestion {
+  prefix: string;
+  key_count: number;
+  depth: number;
+  child_count: number;
+  coverage_pct: number;
+}
+
 export interface ScanResult {
   total_keys: number;
   type_counts: Record<string, number>;
   ttl_buckets: TTLBucket[];
   namespace_counts: Record<string, number>;
   pattern_counts: Record<string, number>;
+  suggested_prefixes: PrefixSuggestion[];
 }
 
 export interface ScanProgress {
