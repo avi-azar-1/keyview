@@ -1,11 +1,14 @@
 import asyncio
 import fnmatch
+import multiprocessing
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 
 from app.config import settings
 from app.models.scan_result import PrefixSuggestion, ScanProgress, ScanResult, TTLBucket
 from app.services.prefix_trie import PrefixTree
 from app.services.redis_client import redis_client
+from app.services.scan_worker import scan_worker_phase1, scan_worker_phase2
 
 TTL_BUCKET_RANGES = [
     ("no TTL", -1, -1),
@@ -100,9 +103,26 @@ class Scanner:
         self._scan_count = scan_count or settings.redis_scan_count
         self._task = asyncio.create_task(self._run_scan())
 
+    def _get_node_params(self) -> list[dict]:
+        """Extract connection parameters for each primary node."""
+        nodes = redis_client._node_connections
+        params_list = []
+        for node in nodes:
+            pool = node.connection_pool
+            kwargs = pool.connection_kwargs
+            params_list.append({
+                "host": kwargs.get("host", "localhost"),
+                "port": kwargs.get("port", 6379),
+                "username": kwargs.get("username"),
+                "password": kwargs.get("password"),
+                "db": kwargs.get("db", 0),
+            })
+        return params_list
+
     async def _run_scan(self):
         """Phase 1: fast scan-only pass. Collects namespaces, patterns, prefixes."""
         nodes = await redis_client.get_primary_nodes()
+        is_cluster = redis_client.is_cluster and len(nodes) > 1
 
         dbsizes = await asyncio.gather(
             *[node.dbsize() for node in nodes], return_exceptions=True
@@ -114,48 +134,117 @@ class Scanner:
         )
         await self._notify()
 
+        if is_cluster:
+            await self._run_scan_parallel(nodes, total_estimate)
+        else:
+            await self._run_scan_single(nodes[0], total_estimate)
+
+        await self._notify()
+        self._start_detail_scan()
+
+    async def _run_scan_parallel(self, nodes, total_estimate: int):
+        """Phase 1 with multiprocessing — one process per node."""
+        node_params = self._get_node_params()
+        manager = multiprocessing.Manager()
+        progress_queue = manager.Queue()
+        loop = asyncio.get_running_loop()
+
+        with ProcessPoolExecutor(max_workers=len(node_params)) as pool:
+            futures = []
+            for i, params in enumerate(node_params):
+                fut = loop.run_in_executor(
+                    pool, scan_worker_phase1,
+                    params["host"], params["port"],
+                    params["username"], params["password"],
+                    params["db"], self._scan_count,
+                    self._patterns, progress_queue, i,
+                    settings.prefix_tree_max_depth, 50,
+                )
+                futures.append(fut)
+
+            worker_progress = [0] * len(node_params)
+
+            async def poll_progress():
+                while True:
+                    drained = False
+                    while not drained:
+                        try:
+                            worker_id, count = progress_queue.get_nowait()
+                            worker_progress[worker_id] = count
+                        except Exception:
+                            drained = True
+                    total = sum(worker_progress)
+                    pct = min((total / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
+                    self._progress = ScanProgress(
+                        status="scanning", scanned=total,
+                        total_estimate=total_estimate, percent=round(pct, 1),
+                    )
+                    await self._notify()
+                    await asyncio.sleep(0.1)
+
+            progress_task = asyncio.create_task(poll_progress())
+            results = await asyncio.gather(*futures)
+            progress_task.cancel()
+
+        # Drain remaining progress messages
+        try:
+            while True:
+                worker_id, count = progress_queue.get_nowait()
+                worker_progress[worker_id] = count
+        except Exception:
+            pass
+        manager.shutdown()
+
+        # Merge results from all workers
+        namespace_counts: dict[str, int] = {}
+        pattern_counts: dict[str, int] = {p: 0 for p in self._patterns}
+        merged_tree = PrefixTree(max_depth=settings.prefix_tree_max_depth, min_count=50)
+        total_scanned = 0
+
+        for r in results:
+            for ns, count in r["namespace_counts"].items():
+                namespace_counts[ns] = namespace_counts.get(ns, 0) + count
+            for pat, count in r["pattern_counts"].items():
+                if pat in pattern_counts:
+                    pattern_counts[pat] += count
+            merged_tree.merge(r["prefix_tree"])
+            total_scanned += r["scanned"]
+
+        self._finalize_phase1(namespace_counts, pattern_counts, merged_tree, total_scanned, total_estimate)
+
+    async def _run_scan_single(self, node, total_estimate: int):
+        """Phase 1 in-process for standalone mode (no multiprocessing overhead)."""
         namespace_counts: dict[str, int] = defaultdict(int)
         pattern_counts: dict[str, int] = defaultdict(int)
-        prefix_tree = PrefixTree(
-            max_depth=settings.prefix_tree_max_depth, min_count=50
-        )
-        self._scanned = 0
-        self._total_estimate = total_estimate
+        prefix_tree = PrefixTree(max_depth=settings.prefix_tree_max_depth, min_count=50)
+        scanned = 0
 
-        async def scan_node(node):
-            cursor = 0
-            while True:
-                cursor, keys = await node.scan(cursor, count=self._scan_count)
+        cursor = 0
+        while True:
+            cursor, keys = await node.scan(cursor, count=self._scan_count)
+            for key in keys:
+                namespace_counts[extract_namespace(key)] += 1
+                prefix_tree.insert(key)
+                for pat in self._patterns:
+                    if fnmatch.fnmatch(key, pat):
+                        pattern_counts[pat] += 1
+                        break
+            scanned += len(keys)
+            pct = min((scanned / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
+            self._progress = ScanProgress(
+                status="scanning", scanned=scanned,
+                total_estimate=total_estimate, percent=round(pct, 1),
+            )
+            await self._notify()
+            if cursor == 0:
+                break
 
-                for key in keys:
-                    namespace_counts[extract_namespace(key)] += 1
-                    prefix_tree.insert(key)
+        self._finalize_phase1(dict(namespace_counts), dict(pattern_counts), prefix_tree, scanned, total_estimate)
 
-                    for pat in self._patterns:
-                        if fnmatch.fnmatch(key, pat):
-                            pattern_counts[pat] += 1
-                            break
-
-                self._scanned += len(keys)
-                pct = min((self._scanned / self._total_estimate) * 100, 100.0) if self._total_estimate > 0 else 100.0
-                self._progress = ScanProgress(
-                    status="scanning",
-                    scanned=self._scanned,
-                    total_estimate=self._total_estimate,
-                    percent=round(pct, 1),
-                )
-                await self._notify()
-
-                if cursor == 0:
-                    break
-
-        await asyncio.gather(*[scan_node(node) for node in nodes])
-
+    def _finalize_phase1(self, namespace_counts, pattern_counts, prefix_tree, total_scanned, total_estimate):
         prune_threshold = max(int(prefix_tree.total_keys * 0.001), 50)
         prefix_tree.prune(prune_threshold)
-        raw_suggestions = prefix_tree.suggest(
-            top_n=settings.prefix_suggestion_count
-        )
+        raw_suggestions = prefix_tree.suggest(top_n=settings.prefix_suggestion_count)
         suggested_prefixes = [
             PrefixSuggestion(
                 prefix=s["prefix"],
@@ -168,24 +257,18 @@ class Scanner:
         ]
 
         self._result = ScanResult(
-            total_keys=self._scanned,
+            total_keys=total_scanned,
             type_counts={},
             ttl_buckets=[],
-            namespace_counts=dict(namespace_counts),
-            pattern_counts=dict(pattern_counts),
+            namespace_counts=namespace_counts,
+            pattern_counts=pattern_counts,
             suggested_prefixes=suggested_prefixes,
         )
 
         self._progress = ScanProgress(
-            status="completed",
-            scanned=self._scanned,
-            total_estimate=self._total_estimate,
-            percent=100.0,
+            status="completed", scanned=total_scanned,
+            total_estimate=total_estimate, percent=100.0,
         )
-        await self._notify()
-
-        # Automatically kick off phase 2 in background
-        self._start_detail_scan()
 
     def _start_detail_scan(self):
         if self._detail_task and not self._detail_task.done():
@@ -195,6 +278,7 @@ class Scanner:
     async def _run_detail_scan(self):
         """Phase 2: full scan with TYPE + TTL pipelines."""
         nodes = await redis_client.get_primary_nodes()
+        is_cluster = redis_client.is_cluster and len(nodes) > 1
 
         dbsizes = await asyncio.gather(
             *[node.dbsize() for node in nodes], return_exceptions=True
@@ -206,74 +290,121 @@ class Scanner:
         )
         await self._notify_detail()
 
+        if is_cluster:
+            await self._run_detail_parallel(nodes, total_estimate)
+        else:
+            await self._run_detail_single(nodes[0], total_estimate)
+
+        await self._notify_detail()
+
+    async def _run_detail_parallel(self, nodes, total_estimate: int):
+        """Phase 2 with multiprocessing — one process per node."""
+        node_params = self._get_node_params()
+        manager = multiprocessing.Manager()
+        progress_queue = manager.Queue()
+        loop = asyncio.get_running_loop()
+
+        with ProcessPoolExecutor(max_workers=len(node_params)) as pool:
+            futures = []
+            for i, params in enumerate(node_params):
+                fut = loop.run_in_executor(
+                    pool, scan_worker_phase2,
+                    params["host"], params["port"],
+                    params["username"], params["password"],
+                    params["db"], self._scan_count,
+                    settings.redis_pipeline_batch,
+                    progress_queue, i,
+                )
+                futures.append(fut)
+
+            worker_progress = [0] * len(node_params)
+
+            async def poll_progress():
+                while True:
+                    drained = False
+                    while not drained:
+                        try:
+                            worker_id, count = progress_queue.get_nowait()
+                            worker_progress[worker_id] = count
+                        except Exception:
+                            drained = True
+                    total = sum(worker_progress)
+                    pct = min((total / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
+                    self._detail_progress = ScanProgress(
+                        status="scanning", scanned=total,
+                        total_estimate=total_estimate, percent=round(pct, 1),
+                    )
+                    await self._notify_detail()
+                    await asyncio.sleep(0.1)
+
+            progress_task = asyncio.create_task(poll_progress())
+            results = await asyncio.gather(*futures)
+            progress_task.cancel()
+
+        manager.shutdown()
+
+        # Merge
+        type_counts: dict[str, int] = {}
+        ttl_counts: dict[str, int] = {}
+        detail_scanned = 0
+
+        for r in results:
+            for t, count in r["type_counts"].items():
+                type_counts[t] = type_counts.get(t, 0) + count
+            for t, count in r["ttl_counts"].items():
+                ttl_counts[t] = ttl_counts.get(t, 0) + count
+            detail_scanned += r["scanned"]
+
+        self._finalize_phase2(type_counts, ttl_counts, detail_scanned, total_estimate)
+
+    async def _run_detail_single(self, node, total_estimate: int):
+        """Phase 2 in-process for standalone mode."""
         type_counts: dict[str, int] = defaultdict(int)
         ttl_counts: dict[str, int] = defaultdict(int)
         detail_scanned = 0
-        max_concurrent_pipelines = 4
 
-        async def run_pipeline(node, batch):
-            pipe = node.pipeline(transaction=False)
-            for key in batch:
-                pipe.type(key)
-                pipe.ttl(key)
-            return await pipe.execute()
+        cursor = 0
+        while True:
+            cursor, keys = await node.scan(cursor, count=self._scan_count)
+            for i in range(0, len(keys), settings.redis_pipeline_batch):
+                batch = keys[i : i + settings.redis_pipeline_batch]
+                pipe = node.pipeline(transaction=False)
+                for key in batch:
+                    pipe.type(key)
+                    pipe.ttl(key)
+                results = await pipe.execute()
+                for j in range(0, len(results), 2):
+                    key_type = results[j]
+                    key_ttl = results[j + 1]
+                    type_counts[key_type] += 1
+                    ttl_counts[classify_ttl(key_ttl)] += 1
+                detail_scanned += len(batch)
 
-        async def scan_node(node):
-            nonlocal detail_scanned
-            cursor = 0
-            while True:
-                cursor, keys = await node.scan(cursor, count=self._scan_count)
+            pct = min((detail_scanned / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
+            self._detail_progress = ScanProgress(
+                status="scanning", scanned=detail_scanned,
+                total_estimate=total_estimate, percent=round(pct, 1),
+            )
+            await self._notify_detail()
+            if cursor == 0:
+                break
 
-                batches = [
-                    keys[i : i + settings.redis_pipeline_batch]
-                    for i in range(0, len(keys), settings.redis_pipeline_batch)
-                ]
+        self._finalize_phase2(dict(type_counts), dict(ttl_counts), detail_scanned, total_estimate)
 
-                for ci in range(0, len(batches), max_concurrent_pipelines):
-                    chunk = batches[ci : ci + max_concurrent_pipelines]
-                    all_results = await asyncio.gather(
-                        *[run_pipeline(node, batch) for batch in chunk]
-                    )
-
-                    for batch, results in zip(chunk, all_results):
-                        for j, key in enumerate(batch):
-                            key_type = results[j * 2]
-                            key_ttl = results[j * 2 + 1]
-                            type_counts[key_type] += 1
-                            ttl_counts[classify_ttl(key_ttl)] += 1
-
-                        detail_scanned += len(batch)
-
-                    pct = min((detail_scanned / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
-                    self._detail_progress = ScanProgress(
-                        status="scanning",
-                        scanned=detail_scanned,
-                        total_estimate=total_estimate,
-                        percent=round(pct, 1),
-                    )
-                    await self._notify_detail()
-
-                if cursor == 0:
-                    break
-
-        await asyncio.gather(*[scan_node(node) for node in nodes])
-
+    def _finalize_phase2(self, type_counts, ttl_counts, detail_scanned, total_estimate):
         ttl_buckets = [
             TTLBucket(label=label, count=ttl_counts.get(label, 0))
             for label, _, _ in TTL_BUCKET_RANGES
         ]
 
         if self._result:
-            self._result.type_counts = dict(type_counts)
+            self._result.type_counts = type_counts
             self._result.ttl_buckets = ttl_buckets
 
         self._detail_progress = ScanProgress(
-            status="completed",
-            scanned=detail_scanned,
-            total_estimate=total_estimate,
-            percent=100.0,
+            status="completed", scanned=detail_scanned,
+            total_estimate=total_estimate, percent=100.0,
         )
-        await self._notify_detail()
 
 
 scanner = Scanner()
