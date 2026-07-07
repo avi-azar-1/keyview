@@ -1,6 +1,9 @@
 from pydantic_settings import BaseSettings
 
 
+AUTO_DOMAIN = ".temp.com"
+
+
 class Settings(BaseSettings):
     static_dir: str = "./static"
     redis_scan_count: int = 1000

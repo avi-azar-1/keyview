@@ -1,4 +1,6 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+from app.config import AUTO_DOMAIN
 
 
 class ConnectionRequest(BaseModel):
@@ -7,6 +9,13 @@ class ConnectionRequest(BaseModel):
     username: str | None = None
     password: str | None = None
     db: int = 0
+
+    @field_validator("host")
+    @classmethod
+    def append_domain(cls, v: str) -> str:
+        if not v.endswith(AUTO_DOMAIN):
+            return v + AUTO_DOMAIN
+        return v
 
 
 class ConnectionInfo(BaseModel):
