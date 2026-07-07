@@ -101,33 +101,47 @@ class Scanner:
         self._scanned = 0
         self._total_estimate = total_estimate
 
+        max_concurrent_pipelines = 4
+
+        async def run_pipeline(node, batch):
+            pipe = node.pipeline(transaction=False)
+            for key in batch:
+                pipe.type(key)
+                pipe.ttl(key)
+            return await pipe.execute()
+
         async def scan_node(node):
             cursor = 0
             while True:
                 cursor, keys = await node.scan(cursor, count=self._scan_count)
 
-                for i in range(0, len(keys), settings.redis_pipeline_batch):
-                    batch = keys[i : i + settings.redis_pipeline_batch]
-                    pipe = node.pipeline(transaction=False)
-                    for key in batch:
-                        pipe.type(key)
-                        pipe.ttl(key)
-                    results = await pipe.execute()
+                batches = [
+                    keys[i : i + settings.redis_pipeline_batch]
+                    for i in range(0, len(keys), settings.redis_pipeline_batch)
+                ]
 
-                    for j, key in enumerate(batch):
-                        key_type = results[j * 2]
-                        key_ttl = results[j * 2 + 1]
+                for ci in range(0, len(batches), max_concurrent_pipelines):
+                    chunk = batches[ci : ci + max_concurrent_pipelines]
+                    all_results = await asyncio.gather(
+                        *[run_pipeline(node, batch) for batch in chunk]
+                    )
 
-                        type_counts[key_type] += 1
-                        ttl_counts[classify_ttl(key_ttl)] += 1
-                        namespace_counts[extract_namespace(key)] += 1
+                    for batch, results in zip(chunk, all_results):
+                        for j, key in enumerate(batch):
+                            key_type = results[j * 2]
+                            key_ttl = results[j * 2 + 1]
 
-                        for pat in self._patterns:
-                            if fnmatch.fnmatch(key, pat):
-                                pattern_counts[pat] += 1
-                                break
+                            type_counts[key_type] += 1
+                            ttl_counts[classify_ttl(key_ttl)] += 1
+                            namespace_counts[extract_namespace(key)] += 1
 
-                    self._scanned += len(batch)
+                            for pat in self._patterns:
+                                if fnmatch.fnmatch(key, pat):
+                                    pattern_counts[pat] += 1
+                                    break
+
+                        self._scanned += len(batch)
+
                     pct = min((self._scanned / self._total_estimate) * 100, 100.0) if self._total_estimate > 0 else 100.0
                     self._progress = ScanProgress(
                         status="scanning",
