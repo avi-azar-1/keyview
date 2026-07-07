@@ -1,3 +1,4 @@
+import asyncio
 import fnmatch
 
 from app.services.redis_client import redis_client
@@ -10,7 +11,7 @@ async def regroup_keys(patterns: list[str]) -> dict[str, int]:
     counts: dict[str, int] = {p: 0 for p in patterns}
     counts["(unmatched)"] = 0
 
-    for node in nodes:
+    async def scan_node(node):
         cursor = 0
         while True:
             cursor, keys = await node.scan(cursor, count=settings.redis_scan_count)
@@ -26,4 +27,5 @@ async def regroup_keys(patterns: list[str]) -> dict[str, int]:
             if cursor == 0:
                 break
 
+    await asyncio.gather(*[scan_node(node) for node in nodes])
     return counts

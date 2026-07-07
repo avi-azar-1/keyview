@@ -79,9 +79,12 @@ class RedisClient:
             self._is_cluster = False
 
     async def get_primary_nodes(self) -> list[aioredis.Redis]:
-        """Return a list of Redis connections to each primary node in the cluster."""
+        """Return cached connections to each primary node in the cluster."""
         if not self._is_cluster or not isinstance(self._client, aioredis.RedisCluster):
             return [self._client]
+
+        if self._node_connections:
+            return self._node_connections
 
         nodes = []
         for node in self._client.get_primaries():
@@ -115,6 +118,8 @@ class RedisClient:
         )
 
     async def _get_cluster_info(self) -> ConnectionInfo:
+        import asyncio
+
         primary_nodes = await self.get_primary_nodes()
         total_keys = 0
         total_clients = 0
@@ -122,16 +127,24 @@ class RedisClient:
         version = "unknown"
         uptime = 0
 
-        for node in primary_nodes:
-            try:
-                node_info = await node.info()
-                version = node_info.get("redis_version", version)
-                total_clients += node_info.get("connected_clients", 0)
-                total_memory += node_info.get("used_memory", 0)
-                uptime = max(uptime, node_info.get("uptime_in_seconds", 0))
-                total_keys += await node.dbsize()
-            except Exception:
-                pass
+        async def fetch_node(node):
+            info = await node.info()
+            size = await node.dbsize()
+            return info, size
+
+        results = await asyncio.gather(
+            *[fetch_node(node) for node in primary_nodes], return_exceptions=True
+        )
+
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            node_info, node_dbsize = r
+            version = node_info.get("redis_version", version)
+            total_clients += node_info.get("connected_clients", 0)
+            total_memory += node_info.get("used_memory", 0)
+            uptime = max(uptime, node_info.get("uptime_in_seconds", 0))
+            total_keys += node_dbsize
 
         if total_memory >= 1073741824:
             mem_human = f"{total_memory / 1073741824:.2f}G"

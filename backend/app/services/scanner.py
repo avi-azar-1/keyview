@@ -83,12 +83,10 @@ class Scanner:
     async def _run_scan(self):
         nodes = await redis_client.get_primary_nodes()
 
-        total_estimate = 0
-        for node in nodes:
-            try:
-                total_estimate += await node.dbsize()
-            except Exception:
-                pass
+        dbsizes = await asyncio.gather(
+            *[node.dbsize() for node in nodes], return_exceptions=True
+        )
+        total_estimate = sum(s for s in dbsizes if isinstance(s, int))
 
         self._progress = ScanProgress(
             status="scanning", scanned=0, total_estimate=total_estimate, percent=0.0
