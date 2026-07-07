@@ -73,9 +73,10 @@ class Scanner:
         for q in self._listeners:
             await q.put(self._progress.model_dump())
 
-    async def start_scan(self):
+    async def start_scan(self, scan_count: int | None = None):
         if self._task and not self._task.done():
             return
+        self._scan_count = scan_count or settings.redis_scan_count
         self._task = asyncio.create_task(self._run_scan())
 
     async def _run_scan(self):
@@ -102,7 +103,7 @@ class Scanner:
         for node in nodes:
             cursor = 0
             while True:
-                cursor, keys = await node.scan(cursor, count=settings.redis_scan_count)
+                cursor, keys = await node.scan(cursor, count=self._scan_count)
 
                 for i in range(0, len(keys), settings.redis_pipeline_batch):
                     batch = keys[i : i + settings.redis_pipeline_batch]

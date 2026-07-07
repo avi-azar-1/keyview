@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 from app.models.scan_result import ScanProgress, ScanResult
 from app.services.redis_client import redis_client
@@ -7,11 +8,15 @@ from app.services.scanner import scanner
 router = APIRouter(prefix="/api/scan", tags=["scan"])
 
 
+class ScanRequest(BaseModel):
+    scan_count: int | None = None
+
+
 @router.post("/start")
-async def start_scan():
+async def start_scan(body: ScanRequest = ScanRequest()):
     if not redis_client.connected:
         raise HTTPException(status_code=400, detail="Not connected to Redis")
-    await scanner.start_scan()
+    await scanner.start_scan(scan_count=body.scan_count)
     return {"status": "started"}
 
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useStore } from "../store";
 import { disconnect } from "../api/connection";
 import { startScan, getScanResults } from "../api/scan";
@@ -17,6 +17,7 @@ export default function Dashboard() {
   const setScanResult = useStore((s) => s.setScanResult);
   const setDisconnected = useStore((s) => s.setDisconnected);
   const wsRef = useRef<WebSocket | null>(null);
+  const [scanCount, setScanCount] = useState(10000);
 
   const handleScan = useCallback(async () => {
     wsRef.current?.close();
@@ -27,8 +28,8 @@ export default function Dashboard() {
         setScanResult(results);
       }
     );
-    await startScan();
-  }, [setScanProgress, setScanResult]);
+    await startScan(scanCount);
+  }, [setScanProgress, setScanResult, scanCount]);
 
   useEffect(() => {
     handleScan();
@@ -59,7 +60,18 @@ export default function Dashboard() {
           {" · "}
           {connectionInfo?.used_memory_human} memory
         </div>
-        <div className="flex gap-3">
+        <div className="flex gap-3 items-center">
+          <label className="text-sm text-gray-600 dark:text-gray-400 flex items-center gap-1">
+            Batch size
+            <input
+              type="number"
+              min={100}
+              step={1000}
+              value={scanCount}
+              onChange={(e) => setScanCount(parseInt(e.target.value) || 1000)}
+              className="w-24 px-2 py-1.5 border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm rounded-lg"
+            />
+          </label>
           <button
             onClick={handleScan}
             disabled={scanProgress.status === "scanning"}

@@ -1,8 +1,8 @@
 import { post, get } from "./client";
 import type { ScanProgress, ScanResult } from "../store";
 
-export function startScan() {
-  return post<{ status: string }>("/api/scan/start");
+export function startScan(scanCount?: number) {
+  return post<{ status: string }>("/api/scan/start", scanCount ? { scan_count: scanCount } : undefined);
 }
 
 export function getScanStatus() {
