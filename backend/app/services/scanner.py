@@ -98,9 +98,10 @@ class Scanner:
         ttl_counts: dict[str, int] = defaultdict(int)
         namespace_counts: dict[str, int] = defaultdict(int)
         pattern_counts: dict[str, int] = defaultdict(int)
-        scanned = 0
+        self._scanned = 0
+        self._total_estimate = total_estimate
 
-        for node in nodes:
+        async def scan_node(node):
             cursor = 0
             while True:
                 cursor, keys = await node.scan(cursor, count=self._scan_count)
@@ -126,12 +127,12 @@ class Scanner:
                                 pattern_counts[pat] += 1
                                 break
 
-                    scanned += len(batch)
-                    pct = min((scanned / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
+                    self._scanned += len(batch)
+                    pct = min((self._scanned / self._total_estimate) * 100, 100.0) if self._total_estimate > 0 else 100.0
                     self._progress = ScanProgress(
                         status="scanning",
-                        scanned=scanned,
-                        total_estimate=total_estimate,
+                        scanned=self._scanned,
+                        total_estimate=self._total_estimate,
                         percent=round(pct, 1),
                     )
                     await self._notify()
@@ -139,13 +140,15 @@ class Scanner:
                 if cursor == 0:
                     break
 
+        await asyncio.gather(*[scan_node(node) for node in nodes])
+
         ttl_buckets = [
             TTLBucket(label=label, count=ttl_counts.get(label, 0))
             for label, _, _ in TTL_BUCKET_RANGES
         ]
 
         self._result = ScanResult(
-            total_keys=scanned,
+            total_keys=self._scanned,
             type_counts=dict(type_counts),
             ttl_buckets=ttl_buckets,
             namespace_counts=dict(namespace_counts),
@@ -154,8 +157,8 @@ class Scanner:
 
         self._progress = ScanProgress(
             status="completed",
-            scanned=scanned,
-            total_estimate=total_estimate,
+            scanned=self._scanned,
+            total_estimate=self._total_estimate,
             percent=100.0,
         )
         await self._notify()

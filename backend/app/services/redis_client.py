@@ -98,25 +98,20 @@ class RedisClient:
         )
 
     async def _get_cluster_info(self) -> ConnectionInfo:
-        info = await self._client.info()
+        primary_nodes = await self.get_primary_nodes()
         total_keys = 0
         total_clients = 0
         total_memory = 0
         version = "unknown"
         uptime = 0
-        node_count = 0
 
-        for node_info in (info if isinstance(info, list) else [info]):
-            if isinstance(node_info, dict):
+        for node in primary_nodes:
+            try:
+                node_info = await node.info()
                 version = node_info.get("redis_version", version)
                 total_clients += node_info.get("connected_clients", 0)
                 total_memory += node_info.get("used_memory", 0)
                 uptime = max(uptime, node_info.get("uptime_in_seconds", 0))
-                node_count += 1
-
-        primary_nodes = await self.get_primary_nodes()
-        for node in primary_nodes:
-            try:
                 total_keys += await node.dbsize()
             except Exception:
                 pass
@@ -137,7 +132,7 @@ class RedisClient:
             total_keys=total_keys,
             uptime_in_seconds=uptime,
             cluster_mode=True,
-            node_count=node_count or len(primary_nodes),
+            node_count=len(primary_nodes),
         )
 
 
