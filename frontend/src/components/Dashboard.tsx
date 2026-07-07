@@ -89,11 +89,16 @@ export default function Dashboard() {
       </div>
 
       {scanProgress.status === "scanning" && (
-        <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2.5">
-          <div
-            className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
-            style={{ width: `${scanProgress.percent}%` }}
-          />
+        <div className="flex items-center gap-3">
+          <div className="flex-1 bg-gray-200 dark:bg-gray-700 rounded-full h-2.5">
+            <div
+              className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
+              style={{ width: `${scanProgress.percent}%` }}
+            />
+          </div>
+          <span className="text-sm font-medium text-gray-700 dark:text-gray-300 w-12 text-right">
+            {scanProgress.percent}%
+          </span>
         </div>
       )}
 
