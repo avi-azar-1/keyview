@@ -19,12 +19,28 @@ export default function Dashboard() {
   const setDisconnected = useStore((s) => s.setDisconnected);
   const wsRef = useRef<WebSocket | null>(null);
   const [scanCount, setScanCount] = useState(10000);
+  const scanStartRef = useRef<number | null>(null);
+  const [eta, setEta] = useState<string>("");
 
   const handleScan = useCallback(async () => {
     wsRef.current?.close();
+    scanStartRef.current = Date.now();
+    setEta("");
     wsRef.current = createScanSocket(
-      (progress) => setScanProgress(progress),
+      (progress) => {
+        setScanProgress(progress);
+        if (progress.status === "scanning" && progress.percent > 0 && scanStartRef.current) {
+          const elapsed = (Date.now() - scanStartRef.current) / 1000;
+          const remaining = (elapsed / progress.percent) * (100 - progress.percent);
+          if (remaining < 60) {
+            setEta(`~${Math.ceil(remaining)}s left`);
+          } else {
+            setEta(`~${Math.ceil(remaining / 60)}m left`);
+          }
+        }
+      },
       async () => {
+        setEta("");
         const results = await getScanResults();
         setScanResult(results);
       }
@@ -97,8 +113,8 @@ export default function Dashboard() {
               style={{ width: `${scanProgress.percent}%` }}
             />
           </div>
-          <span className="text-sm font-medium text-gray-700 dark:text-gray-300 w-12 text-right">
-            {scanProgress.percent}%
+          <span className="text-sm font-medium text-gray-700 dark:text-gray-300 text-right whitespace-nowrap">
+            {scanProgress.percent}%{eta && ` · ${eta}`}
           </span>
         </div>
       )}
