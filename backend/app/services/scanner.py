@@ -3,16 +3,17 @@ import fnmatch
 import logging
 import multiprocessing
 import os
+import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
 from app.config import settings
-
-logger = logging.getLogger(__name__)
 from app.models.scan_result import PrefixSuggestion, ScanProgress, ScanResult, TTLBucket
 from app.services.prefix_trie import PrefixTree
 from app.services.redis_client import redis_client
 from app.services.scan_worker import scan_worker_phase1, scan_worker_phase2
+
+logger = logging.getLogger(__name__)
 
 TTL_BUCKET_RANGES = [
     ("no TTL", -1, -1),
@@ -103,8 +104,10 @@ class Scanner:
 
     async def start_scan(self, scan_count: int | None = None):
         if self._task and not self._task.done():
+            logger.info("start_scan called but scan already running — ignoring")
             return
         self._scan_count = scan_count or settings.redis_scan_count
+        logger.info("start_scan: scan_count=%d", self._scan_count)
         self._task = asyncio.create_task(self._run_scan())
         self._task.add_done_callback(self._on_task_done)
 
@@ -115,9 +118,10 @@ class Scanner:
             logger.error("Scan task raised an exception", exc_info=task.exception())
             self._progress = ScanProgress(status="error", scanned=0, total_estimate=0, percent=0.0)
             asyncio.get_event_loop().create_task(self._notify())
+        else:
+            logger.info("Scan task completed normally")
 
     def _get_node_params(self) -> list[dict]:
-        """Extract connection parameters for each primary node."""
         nodes = redis_client._node_connections
         params_list = []
         for node in nodes:
@@ -130,17 +134,25 @@ class Scanner:
                 "password": kwargs.get("password"),
                 "db": kwargs.get("db", 0),
             })
+        logger.info("_get_node_params: %d nodes: %s",
+                    len(params_list),
+                    [(p["host"], p["port"]) for p in params_list])
         return params_list
 
     async def _run_scan(self):
-        """Phase 1: fast scan-only pass. Collects namespaces, patterns, prefixes."""
+        """Phase 1: fast scan-only pass."""
+        t0 = time.monotonic()
+        logger.info("_run_scan: starting")
         nodes = await redis_client.get_primary_nodes()
         is_cluster = redis_client.is_cluster and len(nodes) > 1
+        logger.info("_run_scan: is_cluster=%s, node_count=%d", is_cluster, len(nodes))
 
         dbsizes = await asyncio.gather(
             *[node.dbsize() for node in nodes], return_exceptions=True
         )
+        logger.info("_run_scan: dbsizes per node: %s", dbsizes)
         total_estimate = sum(s for s in dbsizes if isinstance(s, int))
+        logger.info("_run_scan: total_estimate=%d", total_estimate)
 
         self._progress = ScanProgress(
             status="scanning", scanned=0, total_estimate=total_estimate, percent=0.0
@@ -152,21 +164,31 @@ class Scanner:
         else:
             await self._run_scan_single(nodes[0], total_estimate)
 
+        logger.info("_run_scan: phase 1 done in %.1fs, notifying and starting detail scan",
+                    time.monotonic() - t0)
         await self._notify()
         self._start_detail_scan()
 
     async def _run_scan_parallel(self, nodes, total_estimate: int):
         """Phase 1 with multiprocessing — one process per node."""
+        t0 = time.monotonic()
         node_params = self._get_node_params()
         max_workers = min(len(node_params), os.cpu_count() or 4)
-        logger.info("Phase 1: %d nodes, %d workers, ~%d keys", len(node_params), max_workers, total_estimate)
+        logger.info("_run_scan_parallel: %d nodes, %d workers, ~%d keys, cpu_count=%s",
+                    len(node_params), max_workers, total_estimate, os.cpu_count())
+
+        logger.info("_run_scan_parallel: creating Manager()")
         manager = multiprocessing.Manager()
+        logger.info("_run_scan_parallel: Manager() ready, creating queue")
         progress_queue = manager.Queue()
         loop = asyncio.get_running_loop()
 
+        logger.info("_run_scan_parallel: submitting %d workers to ProcessPoolExecutor", len(node_params))
         with ProcessPoolExecutor(max_workers=max_workers) as pool:
             futures = []
             for i, params in enumerate(node_params):
+                logger.info("_run_scan_parallel: submitting worker %d -> %s:%d",
+                            i, params["host"], params["port"])
                 fut = loop.run_in_executor(
                     pool, scan_worker_phase1,
                     params["host"], params["port"],
@@ -197,15 +219,24 @@ class Scanner:
                     await self._notify()
                     await asyncio.sleep(0.1)
 
+            logger.info("_run_scan_parallel: starting poll_progress task, awaiting all workers")
             progress_task = asyncio.create_task(poll_progress())
             results = await asyncio.gather(*futures, return_exceptions=True)
             progress_task.cancel()
+            logger.info("_run_scan_parallel: all workers returned in %.1fs", time.monotonic() - t0)
+
             for i, r in enumerate(results):
                 if isinstance(r, Exception):
                     logger.error("Phase 1 worker %d failed: %s", i, r, exc_info=r)
+                else:
+                    logger.info("Phase 1 worker %d ok: scanned=%d namespaces=%d",
+                                i, r.get("scanned", 0), len(r.get("namespace_counts", {})))
             results = [r for r in results if not isinstance(r, Exception)]
+            logger.info("_run_scan_parallel: %d/%d workers succeeded",
+                        len(results), len(node_params))
 
-        # Drain remaining progress messages
+        logger.info("_run_scan_parallel: ProcessPoolExecutor exited (%.1fs)", time.monotonic() - t0)
+
         try:
             while True:
                 worker_id, count = progress_queue.get_nowait()
@@ -213,31 +244,41 @@ class Scanner:
         except Exception:
             pass
 
-        logger.info("Phase 1 workers done, merging results in thread")
+        logger.info("_run_scan_parallel: starting merge in thread (%.1fs)", time.monotonic() - t0)
 
         def _merge_phase1(results, patterns):
+            mt0 = time.monotonic()
+            logger.info("_merge_phase1: starting manager.shutdown()")
             manager.shutdown()
+            logger.info("_merge_phase1: manager.shutdown() done in %.1fs", time.monotonic() - mt0)
             namespace_counts: dict[str, int] = {}
             pattern_counts: dict[str, int] = {p: 0 for p in patterns}
             merged_tree = PrefixTree(max_depth=settings.prefix_tree_max_depth, min_count=50)
             total_scanned = 0
-            for r in results:
+            for idx, r in enumerate(results):
                 for ns, count in r["namespace_counts"].items():
                     namespace_counts[ns] = namespace_counts.get(ns, 0) + count
                 for pat, count in r["pattern_counts"].items():
                     if pat in pattern_counts:
                         pattern_counts[pat] += count
+                logger.info("_merge_phase1: merging tree from worker %d (%d keys)", idx, r["scanned"])
                 merged_tree.merge(r["prefix_tree"])
+                logger.info("_merge_phase1: tree merge %d done", idx)
                 total_scanned += r["scanned"]
+            logger.info("_merge_phase1: all merges done, total_scanned=%d (%.1fs)",
+                        total_scanned, time.monotonic() - mt0)
             return namespace_counts, pattern_counts, merged_tree, total_scanned
 
         namespace_counts, pattern_counts, merged_tree, total_scanned = await loop.run_in_executor(
             None, _merge_phase1, results, list(self._patterns)
         )
+        logger.info("_run_scan_parallel: merge done, calling _finalize_phase1 (%.1fs total)",
+                    time.monotonic() - t0)
         self._finalize_phase1(namespace_counts, pattern_counts, merged_tree, total_scanned, total_estimate)
+        logger.info("_run_scan_parallel: complete (%.1fs total)", time.monotonic() - t0)
 
     async def _run_scan_single(self, node, total_estimate: int):
-        """Phase 1 in-process for standalone mode (no multiprocessing overhead)."""
+        """Phase 1 in-process for standalone mode."""
         namespace_counts: dict[str, int] = defaultdict(int)
         pattern_counts: dict[str, int] = defaultdict(int)
         prefix_tree = PrefixTree(max_depth=settings.prefix_tree_max_depth, min_count=50)
@@ -266,9 +307,14 @@ class Scanner:
         self._finalize_phase1(dict(namespace_counts), dict(pattern_counts), prefix_tree, scanned, total_estimate)
 
     def _finalize_phase1(self, namespace_counts, pattern_counts, prefix_tree, total_scanned, total_estimate):
+        t0 = time.monotonic()
+        logger.info("_finalize_phase1: total_scanned=%d, namespaces=%d, pruning tree",
+                    total_scanned, len(namespace_counts))
         prune_threshold = max(int(prefix_tree.total_keys * 0.001), 50)
         prefix_tree.prune(prune_threshold)
+        logger.info("_finalize_phase1: prune done, suggesting prefixes")
         raw_suggestions = prefix_tree.suggest(top_n=settings.prefix_suggestion_count)
+        logger.info("_finalize_phase1: got %d suggestions (%.2fs)", len(raw_suggestions), time.monotonic() - t0)
         suggested_prefixes = [
             PrefixSuggestion(
                 prefix=s["prefix"],
@@ -293,21 +339,37 @@ class Scanner:
             status="completed", scanned=total_scanned,
             total_estimate=total_estimate, percent=100.0,
         )
+        logger.info("_finalize_phase1: done, progress set to completed")
 
     def _start_detail_scan(self):
         if self._detail_task and not self._detail_task.done():
+            logger.info("_start_detail_scan: detail task already running, skipping")
             return
+        logger.info("_start_detail_scan: creating detail task")
         self._detail_task = asyncio.create_task(self._run_detail_scan())
+        self._detail_task.add_done_callback(self._on_detail_task_done)
+
+    def _on_detail_task_done(self, task: asyncio.Task):
+        if task.cancelled():
+            logger.warning("Detail scan task was cancelled")
+        elif task.exception():
+            logger.error("Detail scan task raised an exception", exc_info=task.exception())
+        else:
+            logger.info("Detail scan task completed normally")
 
     async def _run_detail_scan(self):
         """Phase 2: full scan with TYPE + TTL pipelines."""
+        t0 = time.monotonic()
+        logger.info("_run_detail_scan: starting")
         nodes = await redis_client.get_primary_nodes()
         is_cluster = redis_client.is_cluster and len(nodes) > 1
+        logger.info("_run_detail_scan: is_cluster=%s, node_count=%d", is_cluster, len(nodes))
 
         dbsizes = await asyncio.gather(
             *[node.dbsize() for node in nodes], return_exceptions=True
         )
         total_estimate = sum(s for s in dbsizes if isinstance(s, int))
+        logger.info("_run_detail_scan: total_estimate=%d", total_estimate)
 
         self._detail_progress = ScanProgress(
             status="scanning", scanned=0, total_estimate=total_estimate, percent=0.0
@@ -319,20 +381,29 @@ class Scanner:
         else:
             await self._run_detail_single(nodes[0], total_estimate)
 
+        logger.info("_run_detail_scan: done in %.1fs, sending final notify", time.monotonic() - t0)
         await self._notify_detail()
 
     async def _run_detail_parallel(self, nodes, total_estimate: int):
         """Phase 2 with multiprocessing — one process per node."""
+        t0 = time.monotonic()
         node_params = self._get_node_params()
         max_workers = min(len(node_params), os.cpu_count() or 4)
-        logger.info("Phase 2: %d nodes, %d workers, ~%d keys", len(node_params), max_workers, total_estimate)
+        logger.info("_run_detail_parallel: %d nodes, %d workers, ~%d keys",
+                    len(node_params), max_workers, total_estimate)
+
+        logger.info("_run_detail_parallel: creating Manager()")
         manager = multiprocessing.Manager()
+        logger.info("_run_detail_parallel: Manager() ready")
         progress_queue = manager.Queue()
         loop = asyncio.get_running_loop()
 
+        logger.info("_run_detail_parallel: submitting workers")
         with ProcessPoolExecutor(max_workers=max_workers) as pool:
             futures = []
             for i, params in enumerate(node_params):
+                logger.info("_run_detail_parallel: submitting worker %d -> %s:%d",
+                            i, params["host"], params["port"])
                 fut = loop.run_in_executor(
                     pool, scan_worker_phase2,
                     params["host"], params["port"],
@@ -363,18 +434,30 @@ class Scanner:
                     await self._notify_detail()
                     await asyncio.sleep(0.1)
 
+            logger.info("_run_detail_parallel: awaiting all workers")
             progress_task = asyncio.create_task(poll_progress())
             results = await asyncio.gather(*futures, return_exceptions=True)
             progress_task.cancel()
+            logger.info("_run_detail_parallel: all workers returned in %.1fs", time.monotonic() - t0)
+
             for i, r in enumerate(results):
                 if isinstance(r, Exception):
                     logger.error("Phase 2 worker %d failed: %s", i, r, exc_info=r)
+                else:
+                    logger.info("Phase 2 worker %d ok: scanned=%d types=%s",
+                                i, r.get("scanned", 0), dict(r.get("type_counts", {})))
             results = [r for r in results if not isinstance(r, Exception)]
+            logger.info("_run_detail_parallel: %d/%d workers succeeded",
+                        len(results), len(node_params))
 
-        logger.info("Phase 2 workers done, merging results in thread")
+        logger.info("_run_detail_parallel: ProcessPoolExecutor exited (%.1fs)", time.monotonic() - t0)
+        logger.info("_run_detail_parallel: starting merge in thread")
 
         def _merge_phase2(results):
+            mt0 = time.monotonic()
+            logger.info("_merge_phase2: starting manager.shutdown()")
             manager.shutdown()
+            logger.info("_merge_phase2: manager.shutdown() done in %.1fs", time.monotonic() - mt0)
             type_counts: dict[str, int] = {}
             ttl_counts: dict[str, int] = {}
             detail_scanned = 0
@@ -384,12 +467,17 @@ class Scanner:
                 for t, count in r["ttl_counts"].items():
                     ttl_counts[t] = ttl_counts.get(t, 0) + count
                 detail_scanned += r["scanned"]
+            logger.info("_merge_phase2: done, detail_scanned=%d (%.1fs)",
+                        detail_scanned, time.monotonic() - mt0)
             return type_counts, ttl_counts, detail_scanned
 
         type_counts, ttl_counts, detail_scanned = await loop.run_in_executor(
             None, _merge_phase2, results
         )
+        logger.info("_run_detail_parallel: merge complete, calling _finalize_phase2 (%.1fs total)",
+                    time.monotonic() - t0)
         self._finalize_phase2(type_counts, ttl_counts, detail_scanned, total_estimate)
+        logger.info("_run_detail_parallel: complete (%.1fs total)", time.monotonic() - t0)
 
     async def _run_detail_single(self, node, total_estimate: int):
         """Phase 2 in-process for standalone mode."""
@@ -426,6 +514,7 @@ class Scanner:
         self._finalize_phase2(dict(type_counts), dict(ttl_counts), detail_scanned, total_estimate)
 
     def _finalize_phase2(self, type_counts, ttl_counts, detail_scanned, total_estimate):
+        logger.info("_finalize_phase2: detail_scanned=%d types=%s", detail_scanned, type_counts)
         ttl_buckets = [
             TTLBucket(label=label, count=ttl_counts.get(label, 0))
             for label, _, _ in TTL_BUCKET_RANGES
@@ -439,6 +528,7 @@ class Scanner:
             status="completed", scanned=detail_scanned,
             total_estimate=total_estimate, percent=100.0,
         )
+        logger.info("_finalize_phase2: done, detail progress set to completed")
 
 
 scanner = Scanner()
