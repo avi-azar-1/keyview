@@ -72,22 +72,26 @@ class PrefixTree:
                 node.children[first_char] = split_node
                 return
 
-    def merge(self, other: "PrefixTree") -> None:
-        """Merge another PrefixTree into this one by re-inserting all paths with counts."""
-        self.total_keys += other.total_keys
-        self._replay_subtree(other.root, "")
+    def to_path_counts(self) -> list[tuple[str, int]]:
+        """Serialize tree as (path, own_count) pairs — compact cross-process transfer format."""
+        result: list[tuple[str, int]] = []
+        stack = [(self.root, "")]
+        while stack:
+            node, prefix = stack.pop()
+            for child in node.children.values():
+                path = prefix + child.edge_label
+                child_sum = sum(gc.count for gc in child.children.values())
+                own = child.count - child_sum
+                if own > 0:
+                    result.append((path, own))
+                stack.append((child, path))
+        return result
 
-    def _replay_subtree(self, src_node: RadixNode, prefix: str) -> None:
-        """Walk src tree and insert each edge-path with its terminal count delta."""
-        for child in src_node.children.values():
-            path = prefix + child.edge_label
-            # The "own" count at this node = keys that terminate here
-            # = child.count - sum(grandchild.count for grandchild in child.children.values())
-            child_sum = sum(gc.count for gc in child.children.values())
-            own_count = child.count - child_sum
-            if own_count > 0:
-                self._insert_bulk(path, own_count)
-            self._replay_subtree(child, path)
+    def merge_path_counts(self, paths: list[tuple[str, int]], key_count: int) -> None:
+        """Merge a serialized (path, count) list — much faster than merging full trees."""
+        self.total_keys += key_count
+        for path, count in paths:
+            self._insert_bulk(path, count)
 
     def _insert_bulk(self, key: str, count: int) -> None:
         """Like insert() but adds `count` instead of 1."""

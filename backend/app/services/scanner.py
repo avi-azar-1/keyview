@@ -261,9 +261,11 @@ class Scanner:
                 for pat, count in r["pattern_counts"].items():
                     if pat in pattern_counts:
                         pattern_counts[pat] += count
-                logger.info("_merge_phase1: merging tree from worker %d (%d keys)", idx, r["scanned"])
-                merged_tree.merge(r["prefix_tree"])
-                logger.info("_merge_phase1: tree merge %d done", idx)
+                paths = r["prefix_tree_paths"]
+                key_count = r["prefix_tree_key_count"]
+                logger.info("_merge_phase1: merging worker %d paths=%d keys=%d", idx, len(paths), key_count)
+                merged_tree.merge_path_counts(paths, key_count)
+                logger.info("_merge_phase1: worker %d merged (%.1fs)", idx, time.monotonic() - mt0)
                 total_scanned += r["scanned"]
             logger.info("_merge_phase1: all merges done, total_scanned=%d (%.1fs)",
                         total_scanned, time.monotonic() - mt0)
