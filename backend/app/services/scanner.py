@@ -1,11 +1,14 @@
 import asyncio
 import fnmatch
+import logging
 import multiprocessing
 import os
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 from app.models.scan_result import PrefixSuggestion, ScanProgress, ScanResult, TTLBucket
 from app.services.prefix_trie import PrefixTree
 from app.services.redis_client import redis_client
@@ -103,6 +106,15 @@ class Scanner:
             return
         self._scan_count = scan_count or settings.redis_scan_count
         self._task = asyncio.create_task(self._run_scan())
+        self._task.add_done_callback(self._on_task_done)
+
+    def _on_task_done(self, task: asyncio.Task):
+        if task.cancelled():
+            logger.warning("Scan task was cancelled")
+        elif task.exception():
+            logger.error("Scan task raised an exception", exc_info=task.exception())
+            self._progress = ScanProgress(status="error", scanned=0, total_estimate=0, percent=0.0)
+            asyncio.get_event_loop().create_task(self._notify())
 
     def _get_node_params(self) -> list[dict]:
         """Extract connection parameters for each primary node."""
@@ -146,11 +158,12 @@ class Scanner:
     async def _run_scan_parallel(self, nodes, total_estimate: int):
         """Phase 1 with multiprocessing — one process per node."""
         node_params = self._get_node_params()
+        max_workers = min(len(node_params), os.cpu_count() or 4)
+        logger.info("Phase 1: %d nodes, %d workers, ~%d keys", len(node_params), max_workers, total_estimate)
         manager = multiprocessing.Manager()
         progress_queue = manager.Queue()
         loop = asyncio.get_running_loop()
 
-        max_workers = min(len(node_params), os.cpu_count() or 4)
         with ProcessPoolExecutor(max_workers=max_workers) as pool:
             futures = []
             for i, params in enumerate(node_params):
@@ -185,8 +198,12 @@ class Scanner:
                     await asyncio.sleep(0.1)
 
             progress_task = asyncio.create_task(poll_progress())
-            results = await asyncio.gather(*futures)
+            results = await asyncio.gather(*futures, return_exceptions=True)
             progress_task.cancel()
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    logger.error("Phase 1 worker %d failed: %s", i, r, exc_info=r)
+            results = [r for r in results if not isinstance(r, Exception)]
 
         # Drain remaining progress messages
         try:
@@ -302,11 +319,12 @@ class Scanner:
     async def _run_detail_parallel(self, nodes, total_estimate: int):
         """Phase 2 with multiprocessing — one process per node."""
         node_params = self._get_node_params()
+        max_workers = min(len(node_params), os.cpu_count() or 4)
+        logger.info("Phase 2: %d nodes, %d workers, ~%d keys", len(node_params), max_workers, total_estimate)
         manager = multiprocessing.Manager()
         progress_queue = manager.Queue()
         loop = asyncio.get_running_loop()
 
-        max_workers = min(len(node_params), os.cpu_count() or 4)
         with ProcessPoolExecutor(max_workers=max_workers) as pool:
             futures = []
             for i, params in enumerate(node_params):
@@ -341,8 +359,12 @@ class Scanner:
                     await asyncio.sleep(0.1)
 
             progress_task = asyncio.create_task(poll_progress())
-            results = await asyncio.gather(*futures)
+            results = await asyncio.gather(*futures, return_exceptions=True)
             progress_task.cancel()
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    logger.error("Phase 2 worker %d failed: %s", i, r, exc_info=r)
+            results = [r for r in results if not isinstance(r, Exception)]
 
         manager.shutdown()
 

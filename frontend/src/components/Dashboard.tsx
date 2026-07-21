@@ -30,61 +30,87 @@ export default function Dashboard() {
   const [detailEta, setDetailEta] = useState<string>("");
   const pendingScanRef = useRef(false);
 
-  // Persistent main scan websocket
+  // Persistent main scan websocket with auto-reconnect
   useEffect(() => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/scan`);
-    ws.onmessage = (event) => {
-      const data: ScanProgress = JSON.parse(event.data);
-      setScanProgress(data);
-      if (data.status === "scanning" && !scanStartRef.current) {
-        scanStartRef.current = Date.now();
-      }
-      if (data.status === "scanning" && data.percent > 0 && scanStartRef.current) {
-        const elapsed = (Date.now() - scanStartRef.current) / 1000;
-        const remaining = (elapsed / data.percent) * (100 - data.percent);
-        if (remaining < 60) {
-          setEta(`~${Math.ceil(remaining)}s left`);
-        } else {
-          setEta(`~${Math.ceil(remaining / 60)}m left`);
+    let destroyed = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    function connect() {
+      if (destroyed) return;
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(`${protocol}//${window.location.host}/ws/scan`);
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "ping") return;
+        const data: ScanProgress = msg;
+        setScanProgress(data);
+        if (data.status === "scanning" && !scanStartRef.current) {
+          scanStartRef.current = Date.now();
         }
-      }
-      if (data.status === "completed") {
-        setEta("");
-        scanStartRef.current = null;
-        if (pendingScanRef.current) {
-          pendingScanRef.current = false;
-          getScanResults().then((results) => {
-            setScanResult(results);
-            // Start listening for detail phase
-            detailStartRef.current = Date.now();
-            detailWsRef.current?.close();
-            detailWsRef.current = createDetailScanSocket(
-              (progress) => {
-                setDetailProgress(progress);
-                if (progress.status === "scanning" && progress.percent > 0 && detailStartRef.current) {
-                  const elapsed = (Date.now() - detailStartRef.current) / 1000;
-                  const remaining = (elapsed / progress.percent) * (100 - progress.percent);
-                  if (remaining < 60) {
-                    setDetailEta(`~${Math.ceil(remaining)}s left`);
-                  } else {
-                    setDetailEta(`~${Math.ceil(remaining / 60)}m left`);
+        if (data.status === "scanning" && data.percent > 0 && scanStartRef.current) {
+          const elapsed = (Date.now() - scanStartRef.current) / 1000;
+          const remaining = (elapsed / data.percent) * (100 - data.percent);
+          if (remaining < 60) {
+            setEta(`~${Math.ceil(remaining)}s left`);
+          } else {
+            setEta(`~${Math.ceil(remaining / 60)}m left`);
+          }
+        }
+        if (data.status === "completed") {
+          setEta("");
+          scanStartRef.current = null;
+          if (pendingScanRef.current) {
+            pendingScanRef.current = false;
+            getScanResults().then((results) => {
+              setScanResult(results);
+              detailStartRef.current = Date.now();
+              detailWsRef.current?.close();
+              detailWsRef.current = createDetailScanSocket(
+                (progress) => {
+                  setDetailProgress(progress);
+                  if (progress.status === "scanning" && progress.percent > 0 && detailStartRef.current) {
+                    const elapsed = (Date.now() - detailStartRef.current) / 1000;
+                    const remaining = (elapsed / progress.percent) * (100 - progress.percent);
+                    if (remaining < 60) {
+                      setDetailEta(`~${Math.ceil(remaining)}s left`);
+                    } else {
+                      setDetailEta(`~${Math.ceil(remaining / 60)}m left`);
+                    }
                   }
+                },
+                async () => {
+                  setDetailEta("");
+                  const r = await getScanResults();
+                  updateDetailResult(r.type_counts, r.ttl_buckets);
                 }
-              },
-              async () => {
-                setDetailEta("");
-                const r = await getScanResults();
-                updateDetailResult(r.type_counts, r.ttl_buckets);
-              }
-            );
-          });
+              );
+            });
+          }
         }
-      }
-    };
-    scanWsRef.current = ws;
+      };
+
+      ws.onclose = (e) => {
+        scanWsRef.current = null;
+        if (!destroyed) {
+          console.warn("Scan WS closed (code=%d), reconnecting in 2s…", e.code);
+          reconnectTimer = setTimeout(connect, 2000);
+        }
+      };
+
+      ws.onerror = (e) => {
+        console.error("Scan WS error", e);
+      };
+
+      scanWsRef.current = ws;
+    }
+
+    connect();
+
     return () => {
-      ws.close();
+      destroyed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      scanWsRef.current?.close();
       scanWsRef.current = null;
     };
   }, [setScanProgress, setScanResult, setDetailProgress, updateDetailResult]);
