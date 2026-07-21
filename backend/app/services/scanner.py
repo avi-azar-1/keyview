@@ -160,7 +160,8 @@ class Scanner:
         node_params = self._get_node_params()
         max_workers = min(len(node_params), os.cpu_count() or 4)
         logger.info("Phase 1: %d nodes, %d workers, ~%d keys", len(node_params), max_workers, total_estimate)
-        progress_queue = multiprocessing.Queue()
+        manager = multiprocessing.Manager()
+        progress_queue = manager.Queue()
         loop = asyncio.get_running_loop()
 
         with ProcessPoolExecutor(max_workers=max_workers) as pool:
@@ -215,6 +216,7 @@ class Scanner:
         logger.info("Phase 1 workers done, merging results in thread")
 
         def _merge_phase1(results, patterns):
+            manager.shutdown()
             namespace_counts: dict[str, int] = {}
             pattern_counts: dict[str, int] = {p: 0 for p in patterns}
             merged_tree = PrefixTree(max_depth=settings.prefix_tree_max_depth, min_count=50)
@@ -324,7 +326,8 @@ class Scanner:
         node_params = self._get_node_params()
         max_workers = min(len(node_params), os.cpu_count() or 4)
         logger.info("Phase 2: %d nodes, %d workers, ~%d keys", len(node_params), max_workers, total_estimate)
-        progress_queue = multiprocessing.Queue()
+        manager = multiprocessing.Manager()
+        progress_queue = manager.Queue()
         loop = asyncio.get_running_loop()
 
         with ProcessPoolExecutor(max_workers=max_workers) as pool:
@@ -371,6 +374,7 @@ class Scanner:
         logger.info("Phase 2 workers done, merging results in thread")
 
         def _merge_phase2(results):
+            manager.shutdown()
             type_counts: dict[str, int] = {}
             ttl_counts: dict[str, int] = {}
             detail_scanned = 0
