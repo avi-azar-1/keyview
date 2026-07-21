@@ -1,6 +1,7 @@
 import asyncio
 import fnmatch
 import multiprocessing
+import os
 from concurrent.futures import ProcessPoolExecutor
 from typing import Callable, Awaitable
 
@@ -54,7 +55,8 @@ async def _regroup_parallel(
     progress_queue = manager.Queue()
     loop = asyncio.get_running_loop()
 
-    with ProcessPoolExecutor(max_workers=len(node_params)) as pool:
+    max_workers = min(len(node_params), os.cpu_count() or 4)
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
         futures = []
         for i, params in enumerate(node_params):
             fut = loop.run_in_executor(
