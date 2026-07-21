@@ -51,8 +51,7 @@ async def _regroup_parallel(
             "db": kwargs.get("db", 0),
         })
 
-    manager = multiprocessing.Manager()
-    progress_queue = manager.Queue()
+    progress_queue = multiprocessing.Queue()
     loop = asyncio.get_running_loop()
 
     max_workers = min(len(node_params), os.cpu_count() or 4)
@@ -87,8 +86,6 @@ async def _regroup_parallel(
         progress_task = asyncio.create_task(poll_progress())
         results = await asyncio.gather(*futures)
         progress_task.cancel()
-
-    manager.shutdown()
 
     # Merge counts
     counts: dict[str, int] = {p: 0 for p in patterns}

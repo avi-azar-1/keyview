@@ -160,8 +160,7 @@ class Scanner:
         node_params = self._get_node_params()
         max_workers = min(len(node_params), os.cpu_count() or 4)
         logger.info("Phase 1: %d nodes, %d workers, ~%d keys", len(node_params), max_workers, total_estimate)
-        manager = multiprocessing.Manager()
-        progress_queue = manager.Queue()
+        progress_queue = multiprocessing.Queue()
         loop = asyncio.get_running_loop()
 
         with ProcessPoolExecutor(max_workers=max_workers) as pool:
@@ -212,23 +211,27 @@ class Scanner:
                 worker_progress[worker_id] = count
         except Exception:
             pass
-        manager.shutdown()
 
-        # Merge results from all workers
-        namespace_counts: dict[str, int] = {}
-        pattern_counts: dict[str, int] = {p: 0 for p in self._patterns}
-        merged_tree = PrefixTree(max_depth=settings.prefix_tree_max_depth, min_count=50)
-        total_scanned = 0
+        logger.info("Phase 1 workers done, merging results in thread")
 
-        for r in results:
-            for ns, count in r["namespace_counts"].items():
-                namespace_counts[ns] = namespace_counts.get(ns, 0) + count
-            for pat, count in r["pattern_counts"].items():
-                if pat in pattern_counts:
-                    pattern_counts[pat] += count
-            merged_tree.merge(r["prefix_tree"])
-            total_scanned += r["scanned"]
+        def _merge_phase1(results, patterns):
+            namespace_counts: dict[str, int] = {}
+            pattern_counts: dict[str, int] = {p: 0 for p in patterns}
+            merged_tree = PrefixTree(max_depth=settings.prefix_tree_max_depth, min_count=50)
+            total_scanned = 0
+            for r in results:
+                for ns, count in r["namespace_counts"].items():
+                    namespace_counts[ns] = namespace_counts.get(ns, 0) + count
+                for pat, count in r["pattern_counts"].items():
+                    if pat in pattern_counts:
+                        pattern_counts[pat] += count
+                merged_tree.merge(r["prefix_tree"])
+                total_scanned += r["scanned"]
+            return namespace_counts, pattern_counts, merged_tree, total_scanned
 
+        namespace_counts, pattern_counts, merged_tree, total_scanned = await loop.run_in_executor(
+            None, _merge_phase1, results, list(self._patterns)
+        )
         self._finalize_phase1(namespace_counts, pattern_counts, merged_tree, total_scanned, total_estimate)
 
     async def _run_scan_single(self, node, total_estimate: int):
@@ -321,8 +324,7 @@ class Scanner:
         node_params = self._get_node_params()
         max_workers = min(len(node_params), os.cpu_count() or 4)
         logger.info("Phase 2: %d nodes, %d workers, ~%d keys", len(node_params), max_workers, total_estimate)
-        manager = multiprocessing.Manager()
-        progress_queue = manager.Queue()
+        progress_queue = multiprocessing.Queue()
         loop = asyncio.get_running_loop()
 
         with ProcessPoolExecutor(max_workers=max_workers) as pool:
@@ -366,20 +368,23 @@ class Scanner:
                     logger.error("Phase 2 worker %d failed: %s", i, r, exc_info=r)
             results = [r for r in results if not isinstance(r, Exception)]
 
-        manager.shutdown()
+        logger.info("Phase 2 workers done, merging results in thread")
 
-        # Merge
-        type_counts: dict[str, int] = {}
-        ttl_counts: dict[str, int] = {}
-        detail_scanned = 0
+        def _merge_phase2(results):
+            type_counts: dict[str, int] = {}
+            ttl_counts: dict[str, int] = {}
+            detail_scanned = 0
+            for r in results:
+                for t, count in r["type_counts"].items():
+                    type_counts[t] = type_counts.get(t, 0) + count
+                for t, count in r["ttl_counts"].items():
+                    ttl_counts[t] = ttl_counts.get(t, 0) + count
+                detail_scanned += r["scanned"]
+            return type_counts, ttl_counts, detail_scanned
 
-        for r in results:
-            for t, count in r["type_counts"].items():
-                type_counts[t] = type_counts.get(t, 0) + count
-            for t, count in r["ttl_counts"].items():
-                ttl_counts[t] = ttl_counts.get(t, 0) + count
-            detail_scanned += r["scanned"]
-
+        type_counts, ttl_counts, detail_scanned = await loop.run_in_executor(
+            None, _merge_phase2, results
+        )
         self._finalize_phase2(type_counts, ttl_counts, detail_scanned, total_estimate)
 
     async def _run_detail_single(self, node, total_estimate: int):
