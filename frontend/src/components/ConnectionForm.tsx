@@ -4,11 +4,13 @@ import { useStore } from "../store";
 
 export default function ConnectionForm() {
   const setConnected = useStore((s) => s.setConnected);
+  const setEstimatePercent = useStore((s) => s.setEstimatePercent);
   const [host, setHost] = useState("localhost");
   const [port, setPort] = useState("6379");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [db, setDb] = useState("0");
+  const [estimate, setEstimate] = useState("100");
   const [clusterMode, setClusterMode] = useState<"auto" | "on" | "off">("auto");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -26,6 +28,8 @@ export default function ConnectionForm() {
         db: parseInt(db),
         cluster_mode: clusterMode === "auto" ? null : clusterMode === "on",
       });
+      const pct = Math.max(1, Math.min(100, parseInt(estimate) || 100));
+      setEstimatePercent(pct);
       setConnected(info);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Connection failed");
@@ -53,7 +57,7 @@ export default function ConnectionForm() {
               required
             />
           </div>
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-3 gap-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
                 Port
@@ -77,7 +81,23 @@ export default function ConnectionForm() {
                 className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
             </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                Estimate %
+              </label>
+              <input
+                type="number"
+                min={1}
+                max={100}
+                value={estimate}
+                onChange={(e) => setEstimate(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              />
+            </div>
           </div>
+          <p className="text-xs text-gray-500 dark:text-gray-400 -mt-2">
+            100% = full scan. Lower = faster rough estimate (results extrapolated).
+          </p>
           <div>
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
               Cluster Mode

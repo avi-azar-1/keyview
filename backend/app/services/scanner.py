@@ -1,6 +1,7 @@
 import asyncio
 import fnmatch
 import logging
+import math
 import multiprocessing
 import os
 import time
@@ -111,6 +112,20 @@ def extract_namespace(key: str, delimiter: str = ":") -> str:
     return "(root)"
 
 
+def _node_scan_limit(dbsize: int, percent: int) -> int:
+    """Per-node key cap for sampling mode. 0 means unlimited (full scan)."""
+    if percent >= 100:
+        return 0
+    return max(1, math.ceil(dbsize * percent / 100))
+
+
+def _node_scale(dbsize: int, scanned: int, percent: int) -> float:
+    """Reverse-normalization factor: dbsize / actual_scanned (self-corrects overshoot)."""
+    if percent >= 100 or scanned <= 0:
+        return 1.0
+    return dbsize / scanned
+
+
 class Scanner:
     def __init__(self):
         self._progress = ScanProgress(status="idle")
@@ -121,6 +136,8 @@ class Scanner:
         self._listeners: list[asyncio.Queue] = []
         self._detail_listeners: list[asyncio.Queue] = []
         self._patterns: list[str] = []
+        self._scan_count: int = settings.redis_scan_count
+        self._estimate_percent: int = 100
 
     @property
     def progress(self) -> ScanProgress:
@@ -168,12 +185,14 @@ class Scanner:
         for q in self._detail_listeners:
             await q.put(self._detail_progress.model_dump())
 
-    async def start_scan(self, scan_count: int | None = None):
+    async def start_scan(self, scan_count: int | None = None, estimate_percent: int = 100):
         if self._task and not self._task.done():
             logger.info("start_scan called but scan already running — ignoring")
             return
         self._scan_count = scan_count or settings.redis_scan_count
-        logger.info("start_scan: scan_count=%d", self._scan_count)
+        self._estimate_percent = max(1, min(100, estimate_percent))
+        logger.info("start_scan: scan_count=%d estimate_percent=%d",
+                    self._scan_count, self._estimate_percent)
         self._task = asyncio.create_task(self._run_scan())
         self._task.add_done_callback(self._on_task_done)
 
@@ -217,31 +236,40 @@ class Scanner:
             *[node.dbsize() for node in nodes], return_exceptions=True
         )
         logger.info("_run_scan: dbsizes per node: %s", dbsizes)
-        total_estimate = sum(s for s in dbsizes if isinstance(s, int))
-        logger.info("_run_scan: total_estimate=%d", total_estimate)
+        node_dbsizes = [s if isinstance(s, int) else 0 for s in dbsizes]
+        total_estimate = sum(node_dbsizes)
+        node_limits = [_node_scan_limit(s, self._estimate_percent) for s in node_dbsizes]
+        # Progress denominator: the sampled target (sum of per-node caps), or full
+        # keyspace when sampling is off (limit 0 → count that node's full dbsize).
+        scan_target = sum(
+            lim if lim else db for lim, db in zip(node_limits, node_dbsizes)
+        )
+        logger.info("_run_scan: total_estimate=%d scan_target=%d percent=%d",
+                    total_estimate, scan_target, self._estimate_percent)
 
         self._progress = ScanProgress(
-            status="scanning", scanned=0, total_estimate=total_estimate, percent=0.0
+            status="scanning", scanned=0, total_estimate=scan_target, percent=0.0
         )
         await self._notify()
 
         if is_cluster:
-            await self._run_scan_parallel(nodes, total_estimate)
+            await self._run_scan_parallel(nodes, node_dbsizes, node_limits, scan_target)
         else:
-            await self._run_scan_single(nodes[0], total_estimate)
+            await self._run_scan_single(nodes[0], node_dbsizes[0], node_limits[0], scan_target)
 
         logger.info("_run_scan: phase 1 done in %.1fs, notifying and starting detail scan",
                     time.monotonic() - t0)
         await self._notify()
         self._start_detail_scan()
 
-    async def _run_scan_parallel(self, nodes, total_estimate: int):
+    async def _run_scan_parallel(self, nodes, node_dbsizes: list[int],
+                                 node_limits: list[int], scan_target: int):
         """Phase 1 with multiprocessing — one process per node."""
         t0 = time.monotonic()
         node_params = self._get_node_params()
         max_workers = min(len(node_params), os.cpu_count() or 4)
-        logger.info("_run_scan_parallel: %d nodes, %d workers, ~%d keys, cpu_count=%s",
-                    len(node_params), max_workers, total_estimate, os.cpu_count())
+        logger.info("_run_scan_parallel: %d nodes, %d workers, target ~%d keys, cpu_count=%s",
+                    len(node_params), max_workers, scan_target, os.cpu_count())
 
         logger.info("_run_scan_parallel: creating Manager()")
         manager = multiprocessing.Manager()
@@ -262,6 +290,7 @@ class Scanner:
                     params["db"], self._scan_count,
                     self._patterns, progress_queue, i,
                     settings.prefix_tree_max_depth, 50,
+                    node_limits[i],
                 )
                 futures.append(fut)
 
@@ -277,10 +306,10 @@ class Scanner:
                         except Exception:
                             drained = True
                     total = sum(worker_progress)
-                    pct = min((total / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
+                    pct = min((total / scan_target) * 100, 100.0) if scan_target > 0 else 100.0
                     self._progress = ScanProgress(
                         status="scanning", scanned=total,
-                        total_estimate=total_estimate, percent=round(pct, 1),
+                        total_estimate=scan_target, percent=round(pct, 1),
                     )
                     await self._notify()
                     await asyncio.sleep(0.1)
@@ -291,13 +320,18 @@ class Scanner:
             progress_task.cancel()
             logger.info("_run_scan_parallel: all workers returned in %.1fs", time.monotonic() - t0)
 
+            # Pair each result with its node dbsize (for reverse-normalization),
+            # then drop failures — keeps dbsize aligned across the filter.
+            paired = []
             for i, r in enumerate(results):
                 if isinstance(r, Exception):
                     logger.error("Phase 1 worker %d failed: %s", i, r, exc_info=r)
                 else:
                     logger.info("Phase 1 worker %d ok: scanned=%d namespaces=%d",
                                 i, r.get("scanned", 0), len(r.get("namespace_counts", {})))
-            results = [r for r in results if not isinstance(r, Exception)]
+                    paired.append((r, node_dbsizes[i]))
+            results = [r for r, _ in paired]
+            result_dbsizes = [db for _, db in paired]
             logger.info("_run_scan_parallel: %d/%d workers succeeded",
                         len(results), len(node_params))
 
@@ -312,7 +346,9 @@ class Scanner:
 
         logger.info("_run_scan_parallel: starting merge in thread (%.1fs)", time.monotonic() - t0)
 
-        def _merge_phase1(results, patterns):
+        percent = self._estimate_percent
+
+        def _merge_phase1(results, dbsizes, patterns):
             mt0 = time.monotonic()
             logger.info("_merge_phase1: starting manager.shutdown()")
             manager.shutdown()
@@ -322,30 +358,35 @@ class Scanner:
             merged_tree = PrefixTree(max_depth=settings.prefix_tree_max_depth, min_count=50)
             total_scanned = 0
             for idx, r in enumerate(results):
+                scale = _node_scale(dbsizes[idx], r["scanned"], percent)
                 for ns, count in r["namespace_counts"].items():
-                    namespace_counts[ns] = namespace_counts.get(ns, 0) + count
+                    namespace_counts[ns] = namespace_counts.get(ns, 0) + round(count * scale)
                 for pat, count in r["pattern_counts"].items():
                     if pat in pattern_counts:
-                        pattern_counts[pat] += count
+                        pattern_counts[pat] += round(count * scale)
                 paths = r["prefix_tree_paths"]
                 key_count = r["prefix_tree_key_count"]
-                logger.info("_merge_phase1: merging worker %d paths=%d keys=%d", idx, len(paths), key_count)
+                if scale != 1.0:
+                    paths = [(p, round(c * scale)) for p, c in paths]
+                    key_count = round(key_count * scale)
+                logger.info("_merge_phase1: merging worker %d paths=%d keys=%d scale=%.3f",
+                            idx, len(paths), key_count, scale)
                 merged_tree.merge_path_counts(paths, key_count)
                 logger.info("_merge_phase1: worker %d merged (%.1fs)", idx, time.monotonic() - mt0)
-                total_scanned += r["scanned"]
+                total_scanned += round(r["scanned"] * scale)
             logger.info("_merge_phase1: all merges done, total_scanned=%d (%.1fs)",
                         total_scanned, time.monotonic() - mt0)
             return namespace_counts, pattern_counts, merged_tree, total_scanned
 
         namespace_counts, pattern_counts, merged_tree, total_scanned = await loop.run_in_executor(
-            None, _merge_phase1, results, list(self._patterns)
+            None, _merge_phase1, results, result_dbsizes, list(self._patterns)
         )
         logger.info("_run_scan_parallel: merge done, calling _finalize_phase1 (%.1fs total)",
                     time.monotonic() - t0)
-        self._finalize_phase1(namespace_counts, pattern_counts, merged_tree, total_scanned, total_estimate)
+        self._finalize_phase1(namespace_counts, pattern_counts, merged_tree, total_scanned, scan_target)
         logger.info("_run_scan_parallel: complete (%.1fs total)", time.monotonic() - t0)
 
-    async def _run_scan_single(self, node, total_estimate: int):
+    async def _run_scan_single(self, node, dbsize: int, scan_limit: int, scan_target: int):
         """Phase 1 in-process for standalone mode."""
         namespace_counts: dict[str, int] = defaultdict(int)
         pattern_counts: dict[str, int] = defaultdict(int)
@@ -363,16 +404,28 @@ class Scanner:
                         pattern_counts[pat] += 1
                         break
             scanned += len(keys)
-            pct = min((scanned / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
+            pct = min((scanned / scan_target) * 100, 100.0) if scan_target > 0 else 100.0
             self._progress = ScanProgress(
                 status="scanning", scanned=scanned,
-                total_estimate=total_estimate, percent=round(pct, 1),
+                total_estimate=scan_target, percent=round(pct, 1),
             )
             await self._notify()
-            if cursor == 0:
+            if cursor == 0 or (scan_limit and scanned >= scan_limit):
                 break
 
-        self._finalize_phase1(dict(namespace_counts), dict(pattern_counts), prefix_tree, scanned, total_estimate)
+        # Reverse-normalize the sampled counts up to the full-keyspace estimate.
+        scale = _node_scale(dbsize, scanned, self._estimate_percent)
+        if scale != 1.0:
+            namespace_counts = {ns: round(c * scale) for ns, c in namespace_counts.items()}
+            pattern_counts = {p: round(c * scale) for p, c in pattern_counts.items()}
+            # Rebuild the prefix tree at scaled counts so suggestions/coverage match.
+            scaled_paths = [(p, round(c * scale)) for p, c in prefix_tree.to_path_counts()]
+            scaled_tree = PrefixTree(max_depth=settings.prefix_tree_max_depth, min_count=50)
+            scaled_tree.merge_path_counts(scaled_paths, round(scanned * scale))
+            prefix_tree = scaled_tree
+        estimated_total = round(scanned * scale)
+
+        self._finalize_phase1(dict(namespace_counts), dict(pattern_counts), prefix_tree, estimated_total, scan_target)
 
     def _finalize_phase1(self, namespace_counts, pattern_counts, prefix_tree, total_scanned, total_estimate):
         t0 = time.monotonic()
@@ -401,6 +454,7 @@ class Scanner:
             namespace_counts=namespace_counts,
             pattern_counts=pattern_counts,
             suggested_prefixes=suggested_prefixes,
+            estimate_percent=self._estimate_percent,
         )
 
         self._progress = ScanProgress(
@@ -436,11 +490,17 @@ class Scanner:
         dbsizes = await asyncio.gather(
             *[node.dbsize() for node in nodes], return_exceptions=True
         )
-        total_estimate = sum(s for s in dbsizes if isinstance(s, int))
-        logger.info("_run_detail_scan: total_estimate=%d", total_estimate)
+        node_dbsizes = [s if isinstance(s, int) else 0 for s in dbsizes]
+        total_estimate = sum(node_dbsizes)
+        node_limits = [_node_scan_limit(s, self._estimate_percent) for s in node_dbsizes]
+        scan_target = sum(
+            lim if lim else db for lim, db in zip(node_limits, node_dbsizes)
+        )
+        logger.info("_run_detail_scan: total_estimate=%d scan_target=%d percent=%d",
+                    total_estimate, scan_target, self._estimate_percent)
 
         self._detail_progress = ScanProgress(
-            status="scanning", scanned=0, total_estimate=total_estimate, percent=0.0
+            status="scanning", scanned=0, total_estimate=scan_target, percent=0.0
         )
         await self._notify_detail()
 
@@ -458,20 +518,23 @@ class Scanner:
                     len(tracked_namespaces), tracked_namespaces)
 
         if is_cluster:
-            await self._run_detail_parallel(nodes, total_estimate, tracked_namespaces)
+            await self._run_detail_parallel(nodes, node_dbsizes, node_limits,
+                                            scan_target, tracked_namespaces)
         else:
-            await self._run_detail_single(nodes[0], total_estimate, tracked_namespaces)
+            await self._run_detail_single(nodes[0], node_dbsizes[0], node_limits[0],
+                                          scan_target, tracked_namespaces)
 
         logger.info("_run_detail_scan: done in %.1fs, sending final notify", time.monotonic() - t0)
         await self._notify_detail()
 
-    async def _run_detail_parallel(self, nodes, total_estimate: int, tracked_namespaces: list[str]):
+    async def _run_detail_parallel(self, nodes, node_dbsizes: list[int], node_limits: list[int],
+                                   scan_target: int, tracked_namespaces: list[str]):
         """Phase 2 with multiprocessing — one process per node."""
         t0 = time.monotonic()
         node_params = self._get_node_params()
         max_workers = min(len(node_params), os.cpu_count() or 4)
-        logger.info("_run_detail_parallel: %d nodes, %d workers, ~%d keys",
-                    len(node_params), max_workers, total_estimate)
+        logger.info("_run_detail_parallel: %d nodes, %d workers, target ~%d keys",
+                    len(node_params), max_workers, scan_target)
 
         logger.info("_run_detail_parallel: creating Manager()")
         manager = multiprocessing.Manager()
@@ -493,6 +556,7 @@ class Scanner:
                     settings.redis_pipeline_batch,
                     progress_queue, i,
                     tracked_namespaces,
+                    node_limits[i],
                 )
                 futures.append(fut)
 
@@ -508,10 +572,10 @@ class Scanner:
                         except Exception:
                             drained = True
                     total = sum(worker_progress)
-                    pct = min((total / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
+                    pct = min((total / scan_target) * 100, 100.0) if scan_target > 0 else 100.0
                     self._detail_progress = ScanProgress(
                         status="scanning", scanned=total,
-                        total_estimate=total_estimate, percent=round(pct, 1),
+                        total_estimate=scan_target, percent=round(pct, 1),
                     )
                     await self._notify_detail()
                     await asyncio.sleep(0.1)
@@ -522,20 +586,27 @@ class Scanner:
             progress_task.cancel()
             logger.info("_run_detail_parallel: all workers returned in %.1fs", time.monotonic() - t0)
 
+            # Pair each result with its node dbsize (for reverse-normalization),
+            # then drop failures — keeps dbsize aligned across the filter.
+            paired = []
             for i, r in enumerate(results):
                 if isinstance(r, Exception):
                     logger.error("Phase 2 worker %d failed: %s", i, r, exc_info=r)
                 else:
                     logger.info("Phase 2 worker %d ok: scanned=%d types=%s",
                                 i, r.get("scanned", 0), dict(r.get("type_counts", {})))
-            results = [r for r in results if not isinstance(r, Exception)]
+                    paired.append((r, node_dbsizes[i]))
+            results = [r for r, _ in paired]
+            result_dbsizes = [db for _, db in paired]
             logger.info("_run_detail_parallel: %d/%d workers succeeded",
                         len(results), len(node_params))
 
         logger.info("_run_detail_parallel: ProcessPoolExecutor exited (%.1fs)", time.monotonic() - t0)
         logger.info("_run_detail_parallel: starting merge in thread")
 
-        def _merge_phase2(results):
+        percent = self._estimate_percent
+
+        def _merge_phase2(results, dbsizes):
             mt0 = time.monotonic()
             logger.info("_merge_phase2: starting manager.shutdown()")
             manager.shutdown()
@@ -545,33 +616,35 @@ class Scanner:
             ns_type: dict[str, dict[str, int]] = {}
             ns_ttl: dict[str, dict[str, int]] = {}
             detail_scanned = 0
-            for r in results:
+            for idx, r in enumerate(results):
+                scale = _node_scale(dbsizes[idx], r["scanned"], percent)
                 for t, count in r["type_counts"].items():
-                    type_counts[t] = type_counts.get(t, 0) + count
+                    type_counts[t] = type_counts.get(t, 0) + round(count * scale)
                 for t, count in r["ttl_counts"].items():
-                    ttl_counts[t] = ttl_counts.get(t, 0) + count
+                    ttl_counts[t] = ttl_counts.get(t, 0) + round(count * scale)
                 for ns, inner in r.get("ns_type_counts", {}).items():
                     dst = ns_type.setdefault(ns, {})
                     for t, count in inner.items():
-                        dst[t] = dst.get(t, 0) + count
+                        dst[t] = dst.get(t, 0) + round(count * scale)
                 for ns, inner in r.get("ns_ttl_counts", {}).items():
                     dst = ns_ttl.setdefault(ns, {})
                     for t, count in inner.items():
-                        dst[t] = dst.get(t, 0) + count
-                detail_scanned += r["scanned"]
+                        dst[t] = dst.get(t, 0) + round(count * scale)
+                detail_scanned += round(r["scanned"] * scale)
             logger.info("_merge_phase2: done, detail_scanned=%d (%.1fs)",
                         detail_scanned, time.monotonic() - mt0)
             return type_counts, ttl_counts, ns_type, ns_ttl, detail_scanned
 
         type_counts, ttl_counts, ns_type, ns_ttl, detail_scanned = await loop.run_in_executor(
-            None, _merge_phase2, results
+            None, _merge_phase2, results, result_dbsizes
         )
         logger.info("_run_detail_parallel: merge complete, calling _finalize_phase2 (%.1fs total)",
                     time.monotonic() - t0)
-        self._finalize_phase2(type_counts, ttl_counts, ns_type, ns_ttl, detail_scanned, total_estimate)
+        self._finalize_phase2(type_counts, ttl_counts, ns_type, ns_ttl, detail_scanned, scan_target)
         logger.info("_run_detail_parallel: complete (%.1fs total)", time.monotonic() - t0)
 
-    async def _run_detail_single(self, node, total_estimate: int, tracked_namespaces: list[str]):
+    async def _run_detail_single(self, node, dbsize: int, scan_limit: int,
+                                 scan_target: int, tracked_namespaces: list[str]):
         """Phase 2 in-process for standalone mode."""
         type_counts: dict[str, int] = defaultdict(int)
         ttl_counts: dict[str, int] = defaultdict(int)
@@ -602,20 +675,29 @@ class Scanner:
                         ns_ttl[ns][bucket] += 1
                 detail_scanned += len(batch)
 
-            pct = min((detail_scanned / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
+            pct = min((detail_scanned / scan_target) * 100, 100.0) if scan_target > 0 else 100.0
             self._detail_progress = ScanProgress(
                 status="scanning", scanned=detail_scanned,
-                total_estimate=total_estimate, percent=round(pct, 1),
+                total_estimate=scan_target, percent=round(pct, 1),
             )
             await self._notify_detail()
-            if cursor == 0:
+            if cursor == 0 or (scan_limit and detail_scanned >= scan_limit):
                 break
 
-        ns_type_plain = {ns: dict(inner) for ns, inner in ns_type.items()}
-        ns_ttl_plain = {ns: dict(inner) for ns, inner in ns_ttl.items()}
+        # Reverse-normalize the sampled counts up to the full-keyspace estimate.
+        scale = _node_scale(dbsize, detail_scanned, self._estimate_percent)
+
+        def _scaled(d):
+            return {k: round(v * scale) for k, v in d.items()}
+
+        type_counts_out = _scaled(type_counts)
+        ttl_counts_out = _scaled(ttl_counts)
+        ns_type_plain = {ns: _scaled(inner) for ns, inner in ns_type.items()}
+        ns_ttl_plain = {ns: _scaled(inner) for ns, inner in ns_ttl.items()}
+        estimated_scanned = round(detail_scanned * scale)
         self._finalize_phase2(
-            dict(type_counts), dict(ttl_counts),
-            ns_type_plain, ns_ttl_plain, detail_scanned, total_estimate,
+            type_counts_out, ttl_counts_out,
+            ns_type_plain, ns_ttl_plain, estimated_scanned, scan_target,
         )
 
     def _finalize_phase2(self, type_counts, ttl_counts, ns_type, ns_ttl, detail_scanned, total_estimate):

@@ -36,3 +36,4 @@ class ScanResult(BaseModel):
     pattern_counts: dict[str, int]
     suggested_prefixes: list[PrefixSuggestion] = []
     namespace_breakdowns: list[NamespaceBreakdown] = []
+    estimate_percent: int = 100

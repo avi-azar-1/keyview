@@ -38,6 +38,7 @@ export interface ScanResult {
   pattern_counts: Record<string, number>;
   suggested_prefixes: PrefixSuggestion[];
   namespace_breakdowns: NamespaceBreakdown[];
+  estimate_percent: number;
 }
 
 export interface ScanProgress {
@@ -61,6 +62,7 @@ interface AppState {
   patterns: Pattern[];
   darkMode: boolean;
   selectedNamespace: string;
+  estimatePercent: number;
 
   setConnected: (info: ConnectionInfo) => void;
   setDisconnected: () => void;
@@ -75,6 +77,7 @@ interface AppState {
     namespace_breakdowns: NamespaceBreakdown[]
   ) => void;
   setSelectedNamespace: (namespace: string) => void;
+  setEstimatePercent: (percent: number) => void;
   toggleDarkMode: () => void;
 }
 
@@ -87,6 +90,7 @@ export const useStore = create<AppState>((set) => ({
   patterns: [],
   darkMode: window.matchMedia("(prefers-color-scheme: dark)").matches,
   selectedNamespace: "All",
+  estimatePercent: 100,
 
   setConnected: (info) => set({ connected: true, connectionInfo: info }),
   setDisconnected: () =>
@@ -115,6 +119,7 @@ export const useStore = create<AppState>((set) => ({
         : null,
     })),
   setSelectedNamespace: (namespace) => set({ selectedNamespace: namespace }),
+  setEstimatePercent: (percent) => set({ estimatePercent: percent }),
   toggleDarkMode: () =>
     set((state) => {
       const next = !state.darkMode;

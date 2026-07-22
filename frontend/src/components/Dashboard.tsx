@@ -22,9 +22,12 @@ export default function Dashboard() {
   const setScanResult = useStore((s) => s.setScanResult);
   const updateDetailResult = useStore((s) => s.updateDetailResult);
   const setDisconnected = useStore((s) => s.setDisconnected);
+  const scanResult = useStore((s) => s.scanResult);
+  const storeEstimatePercent = useStore((s) => s.estimatePercent);
   const scanWsRef = useRef<WebSocket | null>(null);
   const detailWsRef = useRef<WebSocket | null>(null);
   const [scanCount, setScanCount] = useState(10000);
+  const [estimatePercent, setEstimatePercent] = useState(storeEstimatePercent);
   const scanStartRef = useRef<number | null>(null);
   const detailStartRef = useRef<number | null>(null);
   const [eta, setEta] = useState<string>("");
@@ -122,8 +125,9 @@ export default function Dashboard() {
     setDetailEta("");
     pendingScanRef.current = true;
     detailWsRef.current?.close();
-    await startScan(scanCount);
-  }, [scanCount]);
+    const pct = Math.max(1, Math.min(100, estimatePercent || 100));
+    await startScan(scanCount, pct);
+  }, [scanCount, estimatePercent]);
 
   useEffect(() => {
     handleScan();
@@ -165,6 +169,17 @@ export default function Dashboard() {
               className="w-24 px-2 py-1.5 border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm rounded-lg"
             />
           </label>
+          <label className="text-sm text-gray-600 dark:text-gray-400 flex items-center gap-1">
+            Estimate %
+            <input
+              type="number"
+              min={1}
+              max={100}
+              value={estimatePercent}
+              onChange={(e) => setEstimatePercent(parseInt(e.target.value) || 100)}
+              className="w-16 px-2 py-1.5 border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white text-sm rounded-lg"
+            />
+          </label>
           <button
             onClick={handleScan}
             disabled={scanProgress.status === "scanning"}
@@ -191,6 +206,16 @@ export default function Dashboard() {
           </div>
           <span className="text-sm font-medium text-gray-700 dark:text-gray-300 text-right whitespace-nowrap">
             {scanProgress.percent}%{eta && ` · ${eta}`}
+          </span>
+        </div>
+      )}
+
+      {scanResult && scanResult.estimate_percent < 100 && (
+        <div className="flex items-start gap-2 px-4 py-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-sm text-amber-800 dark:text-amber-300">
+          <span className="font-medium">Estimate mode:</span>
+          <span>
+            Results extrapolated from a ~{scanResult.estimate_percent}% sample of the
+            keyspace. Counts are approximate.
           </span>
         </div>
       )}

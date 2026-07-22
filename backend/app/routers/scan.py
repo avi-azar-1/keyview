@@ -10,13 +10,15 @@ router = APIRouter(prefix="/api/scan", tags=["scan"])
 
 class ScanRequest(BaseModel):
     scan_count: int | None = None
+    estimate_percent: int = 100
 
 
 @router.post("/start")
 async def start_scan(body: ScanRequest = ScanRequest()):
     if not redis_client.connected:
         raise HTTPException(status_code=400, detail="Not connected to Redis")
-    await scanner.start_scan(scan_count=body.scan_count)
+    estimate_percent = max(1, min(100, body.estimate_percent))
+    await scanner.start_scan(scan_count=body.scan_count, estimate_percent=estimate_percent)
     return {"status": "started"}
 
 

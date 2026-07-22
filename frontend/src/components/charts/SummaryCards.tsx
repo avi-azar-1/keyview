@@ -4,8 +4,11 @@ export default function SummaryCards() {
   const info = useStore((s) => s.connectionInfo);
   const result = useStore((s) => s.scanResult);
 
+  const estimated = !!result && result.estimate_percent < 100;
+  const approx = (v: string) => (estimated ? `~${v}` : v);
+
   const cards = [
-    { label: "Total Keys", value: result?.total_keys?.toLocaleString() ?? "-" },
+    { label: "Total Keys", value: result ? approx(result.total_keys.toLocaleString()) : "-" },
     { label: "Memory", value: info?.used_memory_human ?? "-" },
     { label: "Clients", value: info?.connected_clients?.toString() ?? "-" },
     ...(info?.cluster_mode

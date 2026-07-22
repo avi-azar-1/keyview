@@ -59,8 +59,12 @@ def scan_worker_phase1(
     worker_id: int,
     max_depth: int,
     min_count: int,
+    scan_limit: int = 0,
 ) -> dict:
-    """Phase 1: SCAN + namespace + patterns + prefix tree. One node."""
+    """Phase 1: SCAN + namespace + patterns + prefix tree. One node.
+
+    If scan_limit > 0, stops once `scanned >= scan_limit` (sampling mode).
+    """
     t0 = time.monotonic()
     _log(worker_id, f"phase1 start {host}:{port}")
     try:
@@ -103,7 +107,7 @@ def scan_worker_phase1(
         if batch_num % 10 == 0:
             _log(worker_id, f"batch={batch_num} scanned={scanned} cursor={cursor} elapsed={time.monotonic()-t0:.1f}s")
         progress_queue.put((worker_id, scanned))
-        if cursor == 0:
+        if cursor == 0 or (scan_limit and scanned >= scan_limit):
             break
 
     r.close()
@@ -134,11 +138,13 @@ def scan_worker_phase2(
     progress_queue,
     worker_id: int,
     tracked_namespaces: list[str],
+    scan_limit: int = 0,
 ) -> dict:
     """Phase 2: SCAN + TYPE/TTL pipelines. One node.
 
     Tracks aggregate type/ttl counts ("all") plus per-namespace breakdowns
     for the whitelisted `tracked_namespaces` (top-N from phase 1).
+    If scan_limit > 0, stops once `scanned >= scan_limit` (sampling mode).
     """
     t0 = time.monotonic()
     _log(worker_id, f"phase2 start {host}:{port}")
@@ -200,7 +206,7 @@ def scan_worker_phase2(
         if batch_num % 10 == 0:
             _log(worker_id, f"batch={batch_num} scanned={scanned} cursor={cursor} elapsed={time.monotonic()-t0:.1f}s")
         progress_queue.put((worker_id, scanned))
-        if cursor == 0:
+        if cursor == 0 or (scan_limit and scanned >= scan_limit):
             break
 
     r.close()
