@@ -16,12 +16,19 @@ from app.services.scan_worker import scan_worker_phase1, scan_worker_phase2
 logger = logging.getLogger(__name__)
 
 TTL_BUCKET_RANGES = [
-    ("no TTL", -1, -1),
-    ("<1 min", 0, 60),
-    ("1-10 min", 60, 600),
-    ("10 min - 1 hr", 600, 3600),
-    ("1-24 hr", 3600, 86400),
-    (">24 hr", 86400, float("inf")),
+    ("no TTL",        -1,        -1),
+    ("< 10s",          0,        10),
+    ("10s – 1m",        10,        60),
+    ("1 – 5m",         60,       300),
+    ("5 – 30m",        300,      1800),
+    ("30m – 2h",      1800,      7200),
+    ("2 – 12h",       7200,     43200),
+    ("12h – 2d",     43200,    172800),
+    ("2 – 7d",      172800,    604800),
+    ("1 – 4w",      604800,   2419200),
+    ("1 – 6mo",    2419200,  15552000),
+    ("6mo – 2y",  15552000,  63072000),
+    ("> 2y",          63072000, float("inf")),
 ]
 
 
@@ -35,7 +42,60 @@ def classify_ttl(ttl: int) -> str:
             continue
         if low <= ttl < high:
             return label
-    return ">24 hr"
+    return "> 2y"
+
+
+def _format_ttl_secs(s: int | float) -> str:
+    s = int(s)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    if s < 604800:
+        return f"{s // 86400}d"
+    if s < 2592000:
+        return f"{s // 604800}w"
+    if s < 31536000:
+        return f"{s // 2592000}mo"
+    return f"{s // 31536000}y"
+
+
+def _ttl_range_label(low: int | float, high: int | float) -> str:
+    if low == 0:
+        return f"< {_format_ttl_secs(high)}"
+    if high == float("inf"):
+        return f"> {_format_ttl_secs(low)}"
+    return f"{_format_ttl_secs(low)} – {_format_ttl_secs(high)}"
+
+
+def _merge_ttl_buckets(ttl_counts: dict[str, int], max_buckets: int = 6) -> list[TTLBucket]:
+    no_ttl_count = ttl_counts.get("no TTL", 0)
+    timed = [
+        [label, low, high, ttl_counts.get(label, 0)]
+        for label, low, high in TTL_BUCKET_RANGES
+        if label != "no TTL" and ttl_counts.get(label, 0) > 0
+    ]
+    max_timed = max_buckets - 1
+    while len(timed) > max_timed:
+        best_i = 0
+        best_combined = timed[0][3] + timed[1][3]
+        for i in range(1, len(timed) - 1):
+            combined = timed[i][3] + timed[i + 1][3]
+            if combined < best_combined:
+                best_combined = combined
+                best_i = i
+        left = timed[best_i]
+        right = timed[best_i + 1]
+        merged = [_ttl_range_label(left[1], right[2]), left[1], right[2], left[3] + right[3]]
+        timed[best_i : best_i + 2] = [merged]
+    result = []
+    if no_ttl_count > 0:
+        result.append(TTLBucket(label="no TTL", count=no_ttl_count))
+    for label, _low, _high, count in timed:
+        result.append(TTLBucket(label=label, count=count))
+    return result
 
 
 def extract_namespace(key: str, delimiter: str = ":") -> str:
@@ -517,10 +577,7 @@ class Scanner:
 
     def _finalize_phase2(self, type_counts, ttl_counts, detail_scanned, total_estimate):
         logger.info("_finalize_phase2: detail_scanned=%d types=%s", detail_scanned, type_counts)
-        ttl_buckets = [
-            TTLBucket(label=label, count=ttl_counts.get(label, 0))
-            for label, _, _ in TTL_BUCKET_RANGES
-        ]
+        ttl_buckets = _merge_ttl_buckets(ttl_counts)
 
         if self._result:
             self._result.type_counts = type_counts

@@ -16,12 +16,19 @@ _CONNECT_TIMEOUT = 15   # seconds to establish TCP connection
 _SOCKET_TIMEOUT = 120   # seconds per Redis operation
 
 TTL_BUCKET_RANGES = [
-    ("no TTL", -1, -1),
-    ("<1 min", 0, 60),
-    ("1-10 min", 60, 600),
-    ("10 min - 1 hr", 600, 3600),
-    ("1-24 hr", 3600, 86400),
-    (">24 hr", 86400, float("inf")),
+    ("no TTL",        -1,        -1),
+    ("< 10s",          0,        10),
+    ("10s – 1m",        10,        60),
+    ("1 – 5m",         60,       300),
+    ("5 – 30m",        300,      1800),
+    ("30m – 2h",      1800,      7200),
+    ("2 – 12h",       7200,     43200),
+    ("12h – 2d",     43200,    172800),
+    ("2 – 7d",      172800,    604800),
+    ("1 – 4w",      604800,   2419200),
+    ("1 – 6mo",    2419200,  15552000),
+    ("6mo – 2y",  15552000,  63072000),
+    ("> 2y",          63072000, float("inf")),
 ]
 
 
@@ -33,7 +40,7 @@ def _classify_ttl(ttl: int) -> str:
             continue
         if low <= ttl < high:
             return label
-    return ">24 hr"
+    return "> 2y"
 
 
 def _log(worker_id: int, msg: str):
