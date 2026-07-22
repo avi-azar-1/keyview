@@ -6,6 +6,7 @@ import { createDetailScanSocket } from "../api/websocket";
 import SummaryCards from "./charts/SummaryCards";
 import TypeDistribution from "./charts/TypeDistribution";
 import TTLDistribution from "./charts/TTLDistribution";
+import NamespaceTabs from "./charts/NamespaceTabs";
 import KeyGroupBreakdown from "./charts/KeyGroupBreakdown";
 import NamespaceTreemap from "./charts/NamespaceTreemap";
 import PrefixSuggestions from "./PrefixSuggestions";
@@ -82,7 +83,7 @@ export default function Dashboard() {
                 async () => {
                   setDetailEta("");
                   const r = await getScanResults();
-                  updateDetailResult(r.type_counts, r.ttl_buckets);
+                  updateDetailResult(r.type_counts, r.ttl_buckets, r.namespace_breakdowns);
                 }
               );
             });
@@ -235,6 +236,8 @@ export default function Dashboard() {
             </span>
           </div>
         )}
+
+        <NamespaceTabs />
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <TypeDistribution />

@@ -4,8 +4,15 @@ import { useStore } from "../../store";
 export default function TTLDistribution() {
   const result = useStore((s) => s.scanResult);
   const darkMode = useStore((s) => s.darkMode);
+  const selectedNamespace = useStore((s) => s.selectedNamespace);
 
-  if (!result || result.ttl_buckets.length === 0) {
+  const ttlBuckets =
+    result && selectedNamespace !== "All"
+      ? result.namespace_breakdowns.find((b) => b.namespace === selectedNamespace)
+          ?.ttl_buckets ?? []
+      : result?.ttl_buckets ?? [];
+
+  if (!result || ttlBuckets.length === 0) {
     return (
       <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-100 dark:border-gray-700 flex items-center justify-center h-80">
         <span className="text-gray-400">Analyzing TTL distribution...</span>
@@ -13,8 +20,8 @@ export default function TTLDistribution() {
     );
   }
 
-  const labels = result.ttl_buckets.map((b) => b.label);
-  const values = result.ttl_buckets.map((b) => b.count);
+  const labels = ttlBuckets.map((b) => b.label);
+  const values = ttlBuckets.map((b) => b.count);
 
   const option = {
     title: {

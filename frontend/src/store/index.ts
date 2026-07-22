@@ -23,6 +23,13 @@ export interface PrefixSuggestion {
   coverage_pct: number;
 }
 
+export interface NamespaceBreakdown {
+  namespace: string;
+  total: number;
+  type_counts: Record<string, number>;
+  ttl_buckets: TTLBucket[];
+}
+
 export interface ScanResult {
   total_keys: number;
   type_counts: Record<string, number>;
@@ -30,6 +37,7 @@ export interface ScanResult {
   namespace_counts: Record<string, number>;
   pattern_counts: Record<string, number>;
   suggested_prefixes: PrefixSuggestion[];
+  namespace_breakdowns: NamespaceBreakdown[];
 }
 
 export interface ScanProgress {
@@ -52,6 +60,7 @@ interface AppState {
   scanResult: ScanResult | null;
   patterns: Pattern[];
   darkMode: boolean;
+  selectedNamespace: string;
 
   setConnected: (info: ConnectionInfo) => void;
   setDisconnected: () => void;
@@ -60,7 +69,12 @@ interface AppState {
   setScanResult: (result: ScanResult) => void;
   setPatterns: (patterns: Pattern[]) => void;
   updatePatternCounts: (counts: Record<string, number>) => void;
-  updateDetailResult: (type_counts: Record<string, number>, ttl_buckets: TTLBucket[]) => void;
+  updateDetailResult: (
+    type_counts: Record<string, number>,
+    ttl_buckets: TTLBucket[],
+    namespace_breakdowns: NamespaceBreakdown[]
+  ) => void;
+  setSelectedNamespace: (namespace: string) => void;
   toggleDarkMode: () => void;
 }
 
@@ -72,6 +86,7 @@ export const useStore = create<AppState>((set) => ({
   scanResult: null,
   patterns: [],
   darkMode: window.matchMedia("(prefers-color-scheme: dark)").matches,
+  selectedNamespace: "All",
 
   setConnected: (info) => set({ connected: true, connectionInfo: info }),
   setDisconnected: () =>
@@ -79,12 +94,13 @@ export const useStore = create<AppState>((set) => ({
       connected: false,
       connectionInfo: null,
       scanResult: null,
+      selectedNamespace: "All",
       scanProgress: { status: "idle", scanned: 0, total_estimate: 0, percent: 0 },
       detailProgress: { status: "idle", scanned: 0, total_estimate: 0, percent: 0 },
     }),
   setScanProgress: (progress) => set({ scanProgress: progress }),
   setDetailProgress: (progress) => set({ detailProgress: progress }),
-  setScanResult: (result) => set({ scanResult: result }),
+  setScanResult: (result) => set({ scanResult: result, selectedNamespace: "All" }),
   setPatterns: (patterns) => set({ patterns }),
   updatePatternCounts: (counts) =>
     set((state) => ({
@@ -92,12 +108,13 @@ export const useStore = create<AppState>((set) => ({
         ? { ...state.scanResult, pattern_counts: counts }
         : null,
     })),
-  updateDetailResult: (type_counts, ttl_buckets) =>
+  updateDetailResult: (type_counts, ttl_buckets, namespace_breakdowns) =>
     set((state) => ({
       scanResult: state.scanResult
-        ? { ...state.scanResult, type_counts, ttl_buckets }
+        ? { ...state.scanResult, type_counts, ttl_buckets, namespace_breakdowns }
         : null,
     })),
+  setSelectedNamespace: (namespace) => set({ selectedNamespace: namespace }),
   toggleDarkMode: () =>
     set((state) => {
       const next = !state.darkMode;

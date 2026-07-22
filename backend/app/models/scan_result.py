@@ -21,6 +21,13 @@ class PrefixSuggestion(BaseModel):
     coverage_pct: float
 
 
+class NamespaceBreakdown(BaseModel):
+    namespace: str
+    total: int
+    type_counts: dict[str, int]
+    ttl_buckets: list[TTLBucket]
+
+
 class ScanResult(BaseModel):
     total_keys: int
     type_counts: dict[str, int]
@@ -28,3 +35,4 @@ class ScanResult(BaseModel):
     namespace_counts: dict[str, int]
     pattern_counts: dict[str, int]
     suggested_prefixes: list[PrefixSuggestion] = []
+    namespace_breakdowns: list[NamespaceBreakdown] = []

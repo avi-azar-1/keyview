@@ -133,8 +133,13 @@ def scan_worker_phase2(
     pipeline_batch: int,
     progress_queue,
     worker_id: int,
+    tracked_namespaces: list[str],
 ) -> dict:
-    """Phase 2: SCAN + TYPE/TTL pipelines. One node."""
+    """Phase 2: SCAN + TYPE/TTL pipelines. One node.
+
+    Tracks aggregate type/ttl counts ("all") plus per-namespace breakdowns
+    for the whitelisted `tracked_namespaces` (top-N from phase 1).
+    """
     t0 = time.monotonic()
     _log(worker_id, f"phase2 start {host}:{port}")
     try:
@@ -153,6 +158,9 @@ def scan_worker_phase2(
 
     type_counts: dict[str, int] = {}
     ttl_counts: dict[str, int] = {}
+    tracked = set(tracked_namespaces)
+    ns_type: dict[str, dict[str, int]] = {ns: {} for ns in tracked}
+    ns_ttl: dict[str, dict[str, int]] = {ns: {} for ns in tracked}
     scanned = 0
     cursor = 0
     batch_num = 0
@@ -176,11 +184,18 @@ def scan_worker_phase2(
                 _log(worker_id, f"pipeline.execute() failed at batch={batch_num}: {e}")
                 raise
             for j in range(0, len(pipe_results), 2):
+                key = batch[j // 2]
                 key_type = pipe_results[j]
                 key_ttl = pipe_results[j + 1]
                 type_counts[key_type] = type_counts.get(key_type, 0) + 1
                 bucket = _classify_ttl(key_ttl)
                 ttl_counts[bucket] = ttl_counts.get(bucket, 0) + 1
+                ns = key.split(":")[0] if ":" in key else "(root)"
+                if ns in tracked:
+                    nt = ns_type[ns]
+                    nt[key_type] = nt.get(key_type, 0) + 1
+                    nl = ns_ttl[ns]
+                    nl[bucket] = nl.get(bucket, 0) + 1
             scanned += len(batch)
         if batch_num % 10 == 0:
             _log(worker_id, f"batch={batch_num} scanned={scanned} cursor={cursor} elapsed={time.monotonic()-t0:.1f}s")
@@ -190,7 +205,13 @@ def scan_worker_phase2(
 
     r.close()
     _log(worker_id, f"phase2 done scanned={scanned} in {time.monotonic()-t0:.1f}s")
-    return {"type_counts": type_counts, "ttl_counts": ttl_counts, "scanned": scanned}
+    return {
+        "type_counts": type_counts,
+        "ttl_counts": ttl_counts,
+        "ns_type_counts": ns_type,
+        "ns_ttl_counts": ns_ttl,
+        "scanned": scanned,
+    }
 
 
 def regroup_worker(

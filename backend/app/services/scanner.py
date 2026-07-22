@@ -8,7 +8,13 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
 from app.config import settings
-from app.models.scan_result import PrefixSuggestion, ScanProgress, ScanResult, TTLBucket
+from app.models.scan_result import (
+    NamespaceBreakdown,
+    PrefixSuggestion,
+    ScanProgress,
+    ScanResult,
+    TTLBucket,
+)
 from app.services.prefix_trie import PrefixTree
 from app.services.redis_client import redis_client
 from app.services.scan_worker import scan_worker_phase1, scan_worker_phase2
@@ -438,15 +444,28 @@ class Scanner:
         )
         await self._notify_detail()
 
+        # Phase 1 already computed complete namespace_counts. Pick the top 10 by
+        # count — these are the only namespaces phase 2 builds per-ns breakdowns for.
+        tracked_namespaces: list[str] = []
+        if self._result and self._result.namespace_counts:
+            tracked_namespaces = [
+                ns for ns, _ in sorted(
+                    self._result.namespace_counts.items(),
+                    key=lambda kv: kv[1], reverse=True,
+                )[:10]
+            ]
+        logger.info("_run_detail_scan: tracking %d namespaces: %s",
+                    len(tracked_namespaces), tracked_namespaces)
+
         if is_cluster:
-            await self._run_detail_parallel(nodes, total_estimate)
+            await self._run_detail_parallel(nodes, total_estimate, tracked_namespaces)
         else:
-            await self._run_detail_single(nodes[0], total_estimate)
+            await self._run_detail_single(nodes[0], total_estimate, tracked_namespaces)
 
         logger.info("_run_detail_scan: done in %.1fs, sending final notify", time.monotonic() - t0)
         await self._notify_detail()
 
-    async def _run_detail_parallel(self, nodes, total_estimate: int):
+    async def _run_detail_parallel(self, nodes, total_estimate: int, tracked_namespaces: list[str]):
         """Phase 2 with multiprocessing — one process per node."""
         t0 = time.monotonic()
         node_params = self._get_node_params()
@@ -473,6 +492,7 @@ class Scanner:
                     params["db"], self._scan_count,
                     settings.redis_pipeline_batch,
                     progress_queue, i,
+                    tracked_namespaces,
                 )
                 futures.append(fut)
 
@@ -522,29 +542,42 @@ class Scanner:
             logger.info("_merge_phase2: manager.shutdown() done in %.1fs", time.monotonic() - mt0)
             type_counts: dict[str, int] = {}
             ttl_counts: dict[str, int] = {}
+            ns_type: dict[str, dict[str, int]] = {}
+            ns_ttl: dict[str, dict[str, int]] = {}
             detail_scanned = 0
             for r in results:
                 for t, count in r["type_counts"].items():
                     type_counts[t] = type_counts.get(t, 0) + count
                 for t, count in r["ttl_counts"].items():
                     ttl_counts[t] = ttl_counts.get(t, 0) + count
+                for ns, inner in r.get("ns_type_counts", {}).items():
+                    dst = ns_type.setdefault(ns, {})
+                    for t, count in inner.items():
+                        dst[t] = dst.get(t, 0) + count
+                for ns, inner in r.get("ns_ttl_counts", {}).items():
+                    dst = ns_ttl.setdefault(ns, {})
+                    for t, count in inner.items():
+                        dst[t] = dst.get(t, 0) + count
                 detail_scanned += r["scanned"]
             logger.info("_merge_phase2: done, detail_scanned=%d (%.1fs)",
                         detail_scanned, time.monotonic() - mt0)
-            return type_counts, ttl_counts, detail_scanned
+            return type_counts, ttl_counts, ns_type, ns_ttl, detail_scanned
 
-        type_counts, ttl_counts, detail_scanned = await loop.run_in_executor(
+        type_counts, ttl_counts, ns_type, ns_ttl, detail_scanned = await loop.run_in_executor(
             None, _merge_phase2, results
         )
         logger.info("_run_detail_parallel: merge complete, calling _finalize_phase2 (%.1fs total)",
                     time.monotonic() - t0)
-        self._finalize_phase2(type_counts, ttl_counts, detail_scanned, total_estimate)
+        self._finalize_phase2(type_counts, ttl_counts, ns_type, ns_ttl, detail_scanned, total_estimate)
         logger.info("_run_detail_parallel: complete (%.1fs total)", time.monotonic() - t0)
 
-    async def _run_detail_single(self, node, total_estimate: int):
+    async def _run_detail_single(self, node, total_estimate: int, tracked_namespaces: list[str]):
         """Phase 2 in-process for standalone mode."""
         type_counts: dict[str, int] = defaultdict(int)
         ttl_counts: dict[str, int] = defaultdict(int)
+        tracked = set(tracked_namespaces)
+        ns_type: dict[str, dict[str, int]] = {ns: defaultdict(int) for ns in tracked}
+        ns_ttl: dict[str, dict[str, int]] = {ns: defaultdict(int) for ns in tracked}
         detail_scanned = 0
 
         cursor = 0
@@ -558,10 +591,15 @@ class Scanner:
                     pipe.ttl(key)
                 results = await pipe.execute()
                 for j in range(0, len(results), 2):
+                    key = batch[j // 2]
                     key_type = results[j]
-                    key_ttl = results[j + 1]
+                    bucket = classify_ttl(results[j + 1])
                     type_counts[key_type] += 1
-                    ttl_counts[classify_ttl(key_ttl)] += 1
+                    ttl_counts[bucket] += 1
+                    ns = key.split(":")[0] if ":" in key else "(root)"
+                    if ns in tracked:
+                        ns_type[ns][key_type] += 1
+                        ns_ttl[ns][bucket] += 1
                 detail_scanned += len(batch)
 
             pct = min((detail_scanned / total_estimate) * 100, 100.0) if total_estimate > 0 else 100.0
@@ -573,15 +611,34 @@ class Scanner:
             if cursor == 0:
                 break
 
-        self._finalize_phase2(dict(type_counts), dict(ttl_counts), detail_scanned, total_estimate)
+        ns_type_plain = {ns: dict(inner) for ns, inner in ns_type.items()}
+        ns_ttl_plain = {ns: dict(inner) for ns, inner in ns_ttl.items()}
+        self._finalize_phase2(
+            dict(type_counts), dict(ttl_counts),
+            ns_type_plain, ns_ttl_plain, detail_scanned, total_estimate,
+        )
 
-    def _finalize_phase2(self, type_counts, ttl_counts, detail_scanned, total_estimate):
+    def _finalize_phase2(self, type_counts, ttl_counts, ns_type, ns_ttl, detail_scanned, total_estimate):
         logger.info("_finalize_phase2: detail_scanned=%d types=%s", detail_scanned, type_counts)
         ttl_buckets = _merge_ttl_buckets(ttl_counts)
+
+        breakdowns = []
+        for ns, ns_types in ns_type.items():
+            total = sum(ns_types.values())
+            if total == 0:
+                continue
+            breakdowns.append(NamespaceBreakdown(
+                namespace=ns,
+                total=total,
+                type_counts=ns_types,
+                ttl_buckets=_merge_ttl_buckets(ns_ttl.get(ns, {})),
+            ))
+        breakdowns.sort(key=lambda b: b.total, reverse=True)
 
         if self._result:
             self._result.type_counts = type_counts
             self._result.ttl_buckets = ttl_buckets
+            self._result.namespace_breakdowns = breakdowns
 
         self._detail_progress = ScanProgress(
             status="completed", scanned=detail_scanned,
