@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useStore } from "../store";
-import { disconnect } from "../api/connection";
+import { disconnect, getConnectionInfo } from "../api/connection";
 import { startScan, getScanResults } from "../api/scan";
 import { createDetailScanSocket } from "../api/websocket";
 import SummaryCards from "./charts/SummaryCards";
@@ -20,6 +20,7 @@ export default function Dashboard() {
   const setScanProgress = useStore((s) => s.setScanProgress);
   const setDetailProgress = useStore((s) => s.setDetailProgress);
   const setScanResult = useStore((s) => s.setScanResult);
+  const setConnectionInfo = useStore((s) => s.setConnectionInfo);
   const updateDetailResult = useStore((s) => s.updateDetailResult);
   const setDisconnected = useStore((s) => s.setDisconnected);
   const scanResult = useStore((s) => s.scanResult);
@@ -64,6 +65,7 @@ export default function Dashboard() {
         if (data.status === "completed") {
           setEta("");
           scanStartRef.current = null;
+          getConnectionInfo().then(setConnectionInfo).catch(() => {});
           if (pendingScanRef.current) {
             pendingScanRef.current = false;
             getScanResults().then((results) => {
@@ -117,7 +119,7 @@ export default function Dashboard() {
       scanWsRef.current?.close();
       scanWsRef.current = null;
     };
-  }, [setScanProgress, setScanResult, setDetailProgress, updateDetailResult]);
+  }, [setScanProgress, setScanResult, setDetailProgress, updateDetailResult, setConnectionInfo]);
 
   const handleScan = useCallback(async () => {
     scanStartRef.current = Date.now();

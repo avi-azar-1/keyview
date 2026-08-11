@@ -65,6 +65,7 @@ interface AppState {
   estimatePercent: number;
 
   setConnected: (info: ConnectionInfo) => void;
+  setConnectionInfo: (info: ConnectionInfo) => void;
   setDisconnected: () => void;
   setScanProgress: (progress: ScanProgress) => void;
   setDetailProgress: (progress: ScanProgress) => void;
@@ -93,6 +94,7 @@ export const useStore = create<AppState>((set) => ({
   estimatePercent: 100,
 
   setConnected: (info) => set({ connected: true, connectionInfo: info }),
+  setConnectionInfo: (info) => set({ connectionInfo: info }),
   setDisconnected: () =>
     set({
       connected: false,
