@@ -14,6 +14,7 @@ from app.models.scan_result import (
     PrefixSuggestion,
     ScanProgress,
     ScanResult,
+    SizeBucket,
     TTLBucket,
 )
 from app.services.prefix_trie import PrefixTree
@@ -39,6 +40,22 @@ TTL_BUCKET_RANGES = [
 ]
 
 
+SIZE_BUCKET_RANGES = [
+    ("< 64B",         0,              64),
+    ("64 – 256B",     64,            256),
+    ("256B – 1K",     256,          1024),
+    ("1 – 4K",       1024,          4096),
+    ("4 – 16K",      4096,         16384),
+    ("16 – 64K",    16384,         65536),
+    ("64 – 256K",   65536,        262144),
+    ("256K – 1M",  262144,       1048576),
+    ("1 – 4M",    1048576,       4194304),
+    ("4 – 16M",   4194304,      16777216),
+    ("16 – 64M", 16777216,      67108864),
+    ("> 64M",    67108864, float("inf")),
+]
+
+
 def classify_ttl(ttl: int) -> str:
     if ttl == -1:
         return "no TTL"
@@ -50,6 +67,13 @@ def classify_ttl(ttl: int) -> str:
         if low <= ttl < high:
             return label
     return "> 2y"
+
+
+def classify_size(size: int) -> str:
+    for label, low, high in SIZE_BUCKET_RANGES:
+        if low <= size < high:
+            return label
+    return "> 64M"
 
 
 def _format_ttl_secs(s: int | float) -> str:
@@ -103,6 +127,46 @@ def _merge_ttl_buckets(ttl_counts: dict[str, int], max_buckets: int = 6) -> list
     for label, _low, _high, count in timed:
         result.append(TTLBucket(label=label, count=count))
     return result
+
+
+def _format_bytes_label(n: int | float) -> str:
+    n = int(n)
+    if n < 1024:
+        return f"{n}B"
+    if n < 1048576:
+        return f"{n // 1024}K"
+    if n < 1073741824:
+        return f"{n // 1048576}M"
+    return f"{n // 1073741824}G"
+
+
+def _size_range_label(low: int | float, high: int | float) -> str:
+    if low == 0:
+        return f"< {_format_bytes_label(high)}"
+    if high == float("inf"):
+        return f"> {_format_bytes_label(low)}"
+    return f"{_format_bytes_label(low)} – {_format_bytes_label(high)}"
+
+
+def _merge_size_buckets(size_counts: dict[str, int], max_buckets: int = 6) -> list[SizeBucket]:
+    buckets = [
+        [label, low, high, size_counts.get(label, 0)]
+        for label, low, high in SIZE_BUCKET_RANGES
+        if size_counts.get(label, 0) > 0
+    ]
+    while len(buckets) > max_buckets:
+        best_i = 0
+        best_combined = buckets[0][3] + buckets[1][3]
+        for i in range(1, len(buckets) - 1):
+            combined = buckets[i][3] + buckets[i + 1][3]
+            if combined < best_combined:
+                best_combined = combined
+                best_i = i
+        left = buckets[best_i]
+        right = buckets[best_i + 1]
+        merged = [_size_range_label(left[1], right[2]), left[1], right[2], left[3] + right[3]]
+        buckets[best_i : best_i + 2] = [merged]
+    return [SizeBucket(label=b[0], count=b[3]) for b in buckets]
 
 
 def extract_namespace(key: str, delimiter: str = ":") -> str:
@@ -613,8 +677,10 @@ class Scanner:
             logger.info("_merge_phase2: manager.shutdown() done in %.1fs", time.monotonic() - mt0)
             type_counts: dict[str, int] = {}
             ttl_counts: dict[str, int] = {}
+            size_counts: dict[str, int] = {}
             ns_type: dict[str, dict[str, int]] = {}
             ns_ttl: dict[str, dict[str, int]] = {}
+            ns_size: dict[str, dict[str, int]] = {}
             detail_scanned = 0
             for idx, r in enumerate(results):
                 scale = _node_scale(dbsizes[idx], r["scanned"], percent)
@@ -622,6 +688,8 @@ class Scanner:
                     type_counts[t] = type_counts.get(t, 0) + round(count * scale)
                 for t, count in r["ttl_counts"].items():
                     ttl_counts[t] = ttl_counts.get(t, 0) + round(count * scale)
+                for t, count in r.get("size_counts", {}).items():
+                    size_counts[t] = size_counts.get(t, 0) + round(count * scale)
                 for ns, inner in r.get("ns_type_counts", {}).items():
                     dst = ns_type.setdefault(ns, {})
                     for t, count in inner.items():
@@ -630,17 +698,21 @@ class Scanner:
                     dst = ns_ttl.setdefault(ns, {})
                     for t, count in inner.items():
                         dst[t] = dst.get(t, 0) + round(count * scale)
+                for ns, inner in r.get("ns_size_counts", {}).items():
+                    dst = ns_size.setdefault(ns, {})
+                    for t, count in inner.items():
+                        dst[t] = dst.get(t, 0) + round(count * scale)
                 detail_scanned += round(r["scanned"] * scale)
             logger.info("_merge_phase2: done, detail_scanned=%d (%.1fs)",
                         detail_scanned, time.monotonic() - mt0)
-            return type_counts, ttl_counts, ns_type, ns_ttl, detail_scanned
+            return type_counts, ttl_counts, size_counts, ns_type, ns_ttl, ns_size, detail_scanned
 
-        type_counts, ttl_counts, ns_type, ns_ttl, detail_scanned = await loop.run_in_executor(
+        type_counts, ttl_counts, size_counts, ns_type, ns_ttl, ns_size, detail_scanned = await loop.run_in_executor(
             None, _merge_phase2, results, result_dbsizes
         )
         logger.info("_run_detail_parallel: merge complete, calling _finalize_phase2 (%.1fs total)",
                     time.monotonic() - t0)
-        self._finalize_phase2(type_counts, ttl_counts, ns_type, ns_ttl, detail_scanned, scan_target)
+        self._finalize_phase2(type_counts, ttl_counts, size_counts, ns_type, ns_ttl, ns_size, detail_scanned, scan_target)
         logger.info("_run_detail_parallel: complete (%.1fs total)", time.monotonic() - t0)
 
     async def _run_detail_single(self, node, dbsize: int, scan_limit: int,
@@ -648,9 +720,11 @@ class Scanner:
         """Phase 2 in-process for standalone mode."""
         type_counts: dict[str, int] = defaultdict(int)
         ttl_counts: dict[str, int] = defaultdict(int)
+        size_counts: dict[str, int] = defaultdict(int)
         tracked = set(tracked_namespaces)
         ns_type: dict[str, dict[str, int]] = {ns: defaultdict(int) for ns in tracked}
         ns_ttl: dict[str, dict[str, int]] = {ns: defaultdict(int) for ns in tracked}
+        ns_size: dict[str, dict[str, int]] = {ns: defaultdict(int) for ns in tracked}
         detail_scanned = 0
 
         cursor = 0
@@ -662,17 +736,24 @@ class Scanner:
                 for key in batch:
                     pipe.type(key)
                     pipe.ttl(key)
+                    pipe.memory_usage(key)
                 results = await pipe.execute()
-                for j in range(0, len(results), 2):
-                    key = batch[j // 2]
+                for j in range(0, len(results), 3):
+                    key = batch[j // 3]
                     key_type = results[j]
                     bucket = classify_ttl(results[j + 1])
                     type_counts[key_type] += 1
                     ttl_counts[bucket] += 1
                     ns = key.split(":")[0] if ":" in key else "(root)"
+                    mem = results[j + 2]
+                    size_bucket = classify_size(mem) if mem is not None else None
+                    if size_bucket is not None:
+                        size_counts[size_bucket] += 1
                     if ns in tracked:
                         ns_type[ns][key_type] += 1
                         ns_ttl[ns][bucket] += 1
+                        if size_bucket is not None:
+                            ns_size[ns][size_bucket] += 1
                 detail_scanned += len(batch)
 
             pct = min((detail_scanned / scan_target) * 100, 100.0) if scan_target > 0 else 100.0
@@ -692,17 +773,20 @@ class Scanner:
 
         type_counts_out = _scaled(type_counts)
         ttl_counts_out = _scaled(ttl_counts)
+        size_counts_out = _scaled(size_counts)
         ns_type_plain = {ns: _scaled(inner) for ns, inner in ns_type.items()}
         ns_ttl_plain = {ns: _scaled(inner) for ns, inner in ns_ttl.items()}
+        ns_size_plain = {ns: _scaled(inner) for ns, inner in ns_size.items()}
         estimated_scanned = round(detail_scanned * scale)
         self._finalize_phase2(
-            type_counts_out, ttl_counts_out,
-            ns_type_plain, ns_ttl_plain, estimated_scanned, scan_target,
+            type_counts_out, ttl_counts_out, size_counts_out,
+            ns_type_plain, ns_ttl_plain, ns_size_plain, estimated_scanned, scan_target,
         )
 
-    def _finalize_phase2(self, type_counts, ttl_counts, ns_type, ns_ttl, detail_scanned, total_estimate):
+    def _finalize_phase2(self, type_counts, ttl_counts, size_counts, ns_type, ns_ttl, ns_size, detail_scanned, total_estimate):
         logger.info("_finalize_phase2: detail_scanned=%d types=%s", detail_scanned, type_counts)
         ttl_buckets = _merge_ttl_buckets(ttl_counts)
+        size_buckets = _merge_size_buckets(size_counts)
 
         breakdowns = []
         for ns, ns_types in ns_type.items():
@@ -714,12 +798,14 @@ class Scanner:
                 total=total,
                 type_counts=ns_types,
                 ttl_buckets=_merge_ttl_buckets(ns_ttl.get(ns, {})),
+                size_buckets=_merge_size_buckets(ns_size.get(ns, {})),
             ))
         breakdowns.sort(key=lambda b: b.total, reverse=True)
 
         if self._result:
             self._result.type_counts = type_counts
             self._result.ttl_buckets = ttl_buckets
+            self._result.size_buckets = size_buckets
             self._result.namespace_breakdowns = breakdowns
 
         self._detail_progress = ScanProgress(

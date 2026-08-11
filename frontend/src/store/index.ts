@@ -16,6 +16,11 @@ export interface TTLBucket {
   count: number;
 }
 
+export interface SizeBucket {
+  label: string;
+  count: number;
+}
+
 export interface PrefixSuggestion {
   prefix: string;
   key_count: number;
@@ -29,12 +34,14 @@ export interface NamespaceBreakdown {
   total: number;
   type_counts: Record<string, number>;
   ttl_buckets: TTLBucket[];
+  size_buckets: SizeBucket[];
 }
 
 export interface ScanResult {
   total_keys: number;
   type_counts: Record<string, number>;
   ttl_buckets: TTLBucket[];
+  size_buckets: SizeBucket[];
   namespace_counts: Record<string, number>;
   pattern_counts: Record<string, number>;
   suggested_prefixes: PrefixSuggestion[];
@@ -76,6 +83,7 @@ interface AppState {
   updateDetailResult: (
     type_counts: Record<string, number>,
     ttl_buckets: TTLBucket[],
+    size_buckets: SizeBucket[],
     namespace_breakdowns: NamespaceBreakdown[]
   ) => void;
   setSelectedNamespace: (namespace: string) => void;
@@ -115,10 +123,10 @@ export const useStore = create<AppState>((set) => ({
         ? { ...state.scanResult, pattern_counts: counts }
         : null,
     })),
-  updateDetailResult: (type_counts, ttl_buckets, namespace_breakdowns) =>
+  updateDetailResult: (type_counts, ttl_buckets, size_buckets, namespace_breakdowns) =>
     set((state) => ({
       scanResult: state.scanResult
-        ? { ...state.scanResult, type_counts, ttl_buckets, namespace_breakdowns }
+        ? { ...state.scanResult, type_counts, ttl_buckets, size_buckets, namespace_breakdowns }
         : null,
     })),
   setSelectedNamespace: (namespace) => set({ selectedNamespace: namespace }),

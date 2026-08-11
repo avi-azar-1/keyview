@@ -6,6 +6,7 @@ import { createDetailScanSocket } from "../api/websocket";
 import SummaryCards from "./charts/SummaryCards";
 import TypeDistribution from "./charts/TypeDistribution";
 import TTLDistribution from "./charts/TTLDistribution";
+import SizeDistribution from "./charts/SizeDistribution";
 import NamespaceTabs from "./charts/NamespaceTabs";
 import KeyGroupBreakdown from "./charts/KeyGroupBreakdown";
 import NamespaceTreemap from "./charts/NamespaceTreemap";
@@ -88,7 +89,7 @@ export default function Dashboard() {
                 async () => {
                   setDetailEta("");
                   const r = await getScanResults();
-                  updateDetailResult(r.type_counts, r.ttl_buckets, r.namespace_breakdowns);
+                  updateDetailResult(r.type_counts, r.ttl_buckets, r.size_buckets, r.namespace_breakdowns);
                 }
               );
             });
@@ -236,7 +237,7 @@ export default function Dashboard() {
       <div className="border-t border-gray-200 dark:border-gray-700 pt-6">
         <div className="flex items-center gap-3 mb-4">
           <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
-            Key Types & TTL
+            Key Types, TTL & Size
           </h3>
           {detailProgress.status === "scanning" && (
             <span className="text-xs font-medium text-gray-500 dark:text-gray-400">
@@ -269,6 +270,10 @@ export default function Dashboard() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <TypeDistribution />
           <TTLDistribution />
+        </div>
+
+        <div className="grid grid-cols-1 gap-6 mt-6">
+          <SizeDistribution />
         </div>
       </div>
     </div>

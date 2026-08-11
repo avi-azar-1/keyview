@@ -13,6 +13,11 @@ class TTLBucket(BaseModel):
     count: int
 
 
+class SizeBucket(BaseModel):
+    label: str
+    count: int
+
+
 class PrefixSuggestion(BaseModel):
     prefix: str
     key_count: int
@@ -26,12 +31,14 @@ class NamespaceBreakdown(BaseModel):
     total: int
     type_counts: dict[str, int]
     ttl_buckets: list[TTLBucket]
+    size_buckets: list[SizeBucket] = []
 
 
 class ScanResult(BaseModel):
     total_keys: int
     type_counts: dict[str, int]
     ttl_buckets: list[TTLBucket]
+    size_buckets: list[SizeBucket] = []
     namespace_counts: dict[str, int]
     pattern_counts: dict[str, int]
     suggested_prefixes: list[PrefixSuggestion] = []

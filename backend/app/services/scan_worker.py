@@ -32,6 +32,22 @@ TTL_BUCKET_RANGES = [
 ]
 
 
+SIZE_BUCKET_RANGES = [
+    ("< 64B",         0,              64),
+    ("64 – 256B",     64,            256),
+    ("256B – 1K",     256,          1024),
+    ("1 – 4K",       1024,          4096),
+    ("4 – 16K",      4096,         16384),
+    ("16 – 64K",    16384,         65536),
+    ("64 – 256K",   65536,        262144),
+    ("256K – 1M",  262144,       1048576),
+    ("1 – 4M",    1048576,       4194304),
+    ("4 – 16M",   4194304,      16777216),
+    ("16 – 64M", 16777216,      67108864),
+    ("> 64M",    67108864, float("inf")),
+]
+
+
 def _classify_ttl(ttl: int) -> str:
     if ttl <= -1:
         return "no TTL"
@@ -41,6 +57,13 @@ def _classify_ttl(ttl: int) -> str:
         if low <= ttl < high:
             return label
     return "> 2y"
+
+
+def _classify_size(size: int) -> str:
+    for label, low, high in SIZE_BUCKET_RANGES:
+        if low <= size < high:
+            return label
+    return "> 64M"
 
 
 def _log(worker_id: int, msg: str):
@@ -164,9 +187,11 @@ def scan_worker_phase2(
 
     type_counts: dict[str, int] = {}
     ttl_counts: dict[str, int] = {}
+    size_counts: dict[str, int] = {}
     tracked = set(tracked_namespaces)
     ns_type: dict[str, dict[str, int]] = {ns: {} for ns in tracked}
     ns_ttl: dict[str, dict[str, int]] = {ns: {} for ns in tracked}
+    ns_size: dict[str, dict[str, int]] = {ns: {} for ns in tracked}
     scanned = 0
     cursor = 0
     batch_num = 0
@@ -184,24 +209,32 @@ def scan_worker_phase2(
             for key in batch:
                 pipe.type(key)
                 pipe.ttl(key)
+                pipe.memory_usage(key)
             try:
                 pipe_results = pipe.execute()
             except Exception as e:
                 _log(worker_id, f"pipeline.execute() failed at batch={batch_num}: {e}")
                 raise
-            for j in range(0, len(pipe_results), 2):
-                key = batch[j // 2]
+            for j in range(0, len(pipe_results), 3):
+                key = batch[j // 3]
                 key_type = pipe_results[j]
                 key_ttl = pipe_results[j + 1]
+                key_mem = pipe_results[j + 2]
                 type_counts[key_type] = type_counts.get(key_type, 0) + 1
                 bucket = _classify_ttl(key_ttl)
                 ttl_counts[bucket] = ttl_counts.get(bucket, 0) + 1
+                size_bucket = _classify_size(key_mem) if key_mem is not None else None
+                if size_bucket is not None:
+                    size_counts[size_bucket] = size_counts.get(size_bucket, 0) + 1
                 ns = key.split(":")[0] if ":" in key else "(root)"
                 if ns in tracked:
                     nt = ns_type[ns]
                     nt[key_type] = nt.get(key_type, 0) + 1
                     nl = ns_ttl[ns]
                     nl[bucket] = nl.get(bucket, 0) + 1
+                    if size_bucket is not None:
+                        nz = ns_size[ns]
+                        nz[size_bucket] = nz.get(size_bucket, 0) + 1
             scanned += len(batch)
         if batch_num % 10 == 0:
             _log(worker_id, f"batch={batch_num} scanned={scanned} cursor={cursor} elapsed={time.monotonic()-t0:.1f}s")
@@ -214,8 +247,10 @@ def scan_worker_phase2(
     return {
         "type_counts": type_counts,
         "ttl_counts": ttl_counts,
+        "size_counts": size_counts,
         "ns_type_counts": ns_type,
         "ns_ttl_counts": ns_ttl,
+        "ns_size_counts": ns_size,
         "scanned": scanned,
     }
 
