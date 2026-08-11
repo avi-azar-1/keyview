@@ -157,7 +157,7 @@ export default function Dashboard() {
             </span>
           )}
           {" · "}
-          {connectionInfo?.used_memory_human} memory
+          {connectionInfo?.used_memory_human} / {connectionInfo?.maxmemory_human} memory
         </div>
         <div className="flex gap-3 items-center">
           <label className="text-sm text-gray-600 dark:text-gray-400 flex items-center gap-1">

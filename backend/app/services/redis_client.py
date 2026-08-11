@@ -3,6 +3,16 @@ import redis.asyncio as aioredis
 from app.models.connection import ConnectionRequest, ConnectionInfo
 
 
+def _human_bytes(n: int) -> str:
+    if n >= 1073741824:
+        return f"{n / 1073741824:.2f}G"
+    if n >= 1048576:
+        return f"{n / 1048576:.2f}M"
+    if n >= 1024:
+        return f"{n / 1024:.2f}K"
+    return f"{n}B"
+
+
 class RedisClient:
     def __init__(self):
         self._client: aioredis.Redis | aioredis.RedisCluster | None = None
@@ -107,10 +117,12 @@ class RedisClient:
     async def _get_standalone_info(self) -> ConnectionInfo:
         info = await self._client.info()
         dbsize = await self._client.dbsize()
+        maxmemory = int(info.get("maxmemory", 0) or 0)
         return ConnectionInfo(
             redis_version=info.get("redis_version", "unknown"),
             connected_clients=info.get("connected_clients", 0),
             used_memory_human=info.get("used_memory_human", "0B"),
+            maxmemory_human=_human_bytes(maxmemory) if maxmemory > 0 else "∞",
             total_keys=dbsize,
             uptime_in_seconds=info.get("uptime_in_seconds", 0),
             cluster_mode=False,
@@ -124,6 +136,7 @@ class RedisClient:
         total_keys = 0
         total_clients = 0
         total_memory = 0
+        total_maxmemory = 0
         version = "unknown"
         uptime = 0
 
@@ -143,22 +156,15 @@ class RedisClient:
             version = node_info.get("redis_version", version)
             total_clients += node_info.get("connected_clients", 0)
             total_memory += node_info.get("used_memory", 0)
+            total_maxmemory += int(node_info.get("maxmemory", 0) or 0)
             uptime = max(uptime, node_info.get("uptime_in_seconds", 0))
             total_keys += node_dbsize
-
-        if total_memory >= 1073741824:
-            mem_human = f"{total_memory / 1073741824:.2f}G"
-        elif total_memory >= 1048576:
-            mem_human = f"{total_memory / 1048576:.2f}M"
-        elif total_memory >= 1024:
-            mem_human = f"{total_memory / 1024:.2f}K"
-        else:
-            mem_human = f"{total_memory}B"
 
         return ConnectionInfo(
             redis_version=version,
             connected_clients=total_clients,
-            used_memory_human=mem_human,
+            used_memory_human=_human_bytes(total_memory),
+            maxmemory_human=_human_bytes(total_maxmemory) if total_maxmemory > 0 else "∞",
             total_keys=total_keys,
             uptime_in_seconds=uptime,
             cluster_mode=True,

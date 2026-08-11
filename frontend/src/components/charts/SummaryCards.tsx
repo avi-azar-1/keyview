@@ -9,7 +9,10 @@ export default function SummaryCards() {
 
   const cards = [
     { label: "Total Keys", value: result ? approx(result.total_keys.toLocaleString()) : "-" },
-    { label: "Memory", value: info?.used_memory_human ?? "-" },
+    {
+      label: "Memory",
+      value: info ? `${info.used_memory_human} / ${info.maxmemory_human}` : "-",
+    },
     { label: "Clients", value: info?.connected_clients?.toString() ?? "-" },
     ...(info?.cluster_mode
       ? [{ label: "Primary Nodes", value: info.node_count.toString() }]

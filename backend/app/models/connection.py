@@ -23,6 +23,7 @@ class ConnectionInfo(BaseModel):
     redis_version: str
     connected_clients: int
     used_memory_human: str
+    maxmemory_human: str = "∞"
     total_keys: int
     uptime_in_seconds: int
     cluster_mode: bool = False

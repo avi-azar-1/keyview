@@ -4,6 +4,7 @@ export interface ConnectionInfo {
   redis_version: string;
   connected_clients: number;
   used_memory_human: string;
+  maxmemory_human: string;
   total_keys: number;
   uptime_in_seconds: number;
   cluster_mode: boolean;
